@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:bluepad32.readthedocs.io)",
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:gitlab.com)",
+      "WebFetch(domain:community.platformio.org)",
+      "Bash(find /c/Users/User/Documents/PlatformIO/Projects/Sanjo_Sumo/src -type f \\\\\\(-name *.cpp -o -name *.h -o -name *.hpp \\\\\\))",
+      "Bash(grep -n \"const bool\" /c/Users/User/Documents/PlatformIO/Projects/Sanjo_Sumo/Projects/MainMotorController/*.cpp /c/Users/User/Documents/PlatformIO/Projects/Sanjo_Sumo/Projects/MainMotorController/*.h)",
+      "Bash(grep -n \"wasConnected\\\\|was.*Connected\" /c/Users/User/Documents/PlatformIO/Projects/Sanjo_Sumo/Projects/MainMotorController/*.cpp /c/Users/User/Documents/PlatformIO/Projects/Sanjo_Sumo/Projects/MainMotorController/*.h)",
+      "Bash(grep -A 15 \"local.joyLHori\" /c/Users/User/Documents/PlatformIO/Projects/Sanjo_Sumo/Projects/MainMotorController/*.cpp)",
+      "Bash(find /c/Users/User/Documents/PlatformIO/Projects/Sanjo_Sumo/lib -type f \\\\\\(-name *.cpp -o -name *.h \\\\\\))",
+      "Bash(cmd /c \"cd /d C:\\\\Users\\\\User\\\\Documents\\\\PlatformIO\\\\Projects\\\\Sanjo_Sumo && C:\\\\Users\\\\User\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe run -e MainMotorController 2>&1\")",
+      "Bash(cmd /c \"C:\\\\Users\\\\User\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe run --project-dir C:\\\\Users\\\\User\\\\Documents\\\\PlatformIO\\\\Projects\\\\Sanjo_Sumo -e MainMotorController 2>&1\")",
+      "Bash(cmd /c \"C:\\\\Users\\\\User\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe run --project-dir C:\\\\Users\\\\User\\\\Documents\\\\PlatformIO\\\\Projects\\\\Sanjo_Sumo -e MainMotorController\")",
+      "Bash(powershell -Command \"& ''C:\\\\Users\\\\User\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe'' run --project-dir ''C:\\\\Users\\\\User\\\\Documents\\\\PlatformIO\\\\Projects\\\\Sanjo_Sumo'' -e MainMotorController 2>&1 | Tee-Object -Variable out; $out\")",
+      "Bash(powershell -Command \"& ''C:\\\\Users\\\\User\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe'' run --project-dir ''C:\\\\Users\\\\User\\\\Documents\\\\PlatformIO\\\\Projects\\\\Sanjo_Sumo'' -e MainMotorController 2>&1 | Select-String -Pattern ''error:|warning:|SUCCESS|FAILED''\")",
+      "Bash(powershell -Command \"\\(Get-Content ''C:\\\\Users\\\\User\\\\Documents\\\\PlatformIO\\\\Projects\\\\Sanjo_Sumo\\\\Projects\\\\MainMotorController\\\\main.cpp''\\) -replace ''\\\\bSERIAL\\\\b'', ''TSLOG'' | Set-Content ''C:\\\\Users\\\\User\\\\Documents\\\\PlatformIO\\\\Projects\\\\Sanjo_Sumo\\\\Projects\\\\MainMotorController\\\\main.cpp''\")"
+    ]
+  }
+}
