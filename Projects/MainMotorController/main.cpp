@@ -53,7 +53,14 @@ Adafruit_INA219  ina219(INA219_I2C_ADDR);
 
 // ─── Globals + thread-safe TSLOG ─────────────────────────────────────────────
 
-static volatile bool     gMotorTestActive = false;
+static volatile bool     gMotorTestActive  = false;
+
+// ─── Test distance ─────────────────────────────────────────────────────────
+static volatile bool  gDistTestActive  = false;  // moteurs en course
+static volatile bool  gDistTestDone    = false;  // résultats prêts à afficher
+static volatile float gDistTestL_cm   = 0.0f;   // distance roue gauche (cm)
+static volatile float gDistTestR_cm   = 0.0f;   // distance roue droite (cm)
+static volatile float gDistTestVmax   = 0.0f;   // vitesse max mesurée (cm/s)
 static SemaphoreHandle_t gSerialMutex     = nullptr;
 
 static volatile uint16_t gTofDistMm[2]   = {0, 0};
@@ -781,8 +788,48 @@ static void OledTask(void*) {
     uint8_t   stableFrames  = 0;
     uint32_t  lastSoundMs   = 0;
 
+    uint32_t distDoneMs = 0;   // timestamp fin du test (pour affichage 10s)
+
     for (;;) {
         oled.clearDisplay();
+
+        // ── Test distance en cours ────────────────────────────────────────
+        if (gDistTestActive) {
+            oled.setTextSize(1);
+            oled.setTextColor(SSD1306_WHITE);
+            oled.setCursor(16, 10);  oled.print("TEST DISTANCE");
+            oled.setCursor(28, 24);  oled.print("EN COURS...");
+            oled.setCursor(20, 38);  oled.print("5 secondes @ 100%");
+            oled.display();
+            memcpy(oled2.getBuffer(), oled.getBuffer(), 128 * 64 / 8);
+            oled2.display();
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        // ── Résultat test distance (affiché 10s) ─────────────────────────
+        if (gDistTestDone) {
+            if (distDoneMs == 0) distDoneMs = millis();
+            if (millis() - distDoneMs < 10000) {
+                oled.setTextSize(1);
+                oled.setTextColor(SSD1306_WHITE);
+                oled.setCursor(22, 0);   oled.print("RESULTAT TEST 5s");
+                oled.drawFastHLine(0, 10, 128, SSD1306_WHITE);
+                oled.setCursor(0, 14);   oled.printf("Dist L : %6.1f cm", gDistTestL_cm);
+                oled.setCursor(0, 24);   oled.printf("Dist R : %6.1f cm", gDistTestR_cm);
+                oled.setCursor(0, 34);   oled.printf("Moy    : %6.1f cm", (gDistTestL_cm + gDistTestR_cm) * 0.5f);
+                oled.drawFastHLine(0, 45, 128, SSD1306_WHITE);
+                oled.setCursor(0, 48);   oled.printf("Vmax   : %6.1f cm/s", gDistTestVmax);
+                oled.setCursor(0, 57);   oled.printf("Vtheo  :  ~101.0 cm/s");
+                oled.display();
+                memcpy(oled2.getBuffer(), oled.getBuffer(), 128 * 64 / 8);
+                oled2.display();
+                vTaskDelay(pdMS_TO_TICKS(200));
+                continue;
+            }
+            gDistTestDone = false;
+            distDoneMs    = 0;
+        }
 
         XboxState xs;
         xbox.getState(xs);
@@ -1010,19 +1057,82 @@ void setup() {
     Serial.println("[Setup] Pret\n");
 }
 
+// ─── Test distance ────────────────────────────────────────────────────────────
+// Appui BOOT : moteurs avant à 100% pendant 5s, mesure distance via encodeurs.
+// cm/count = π × 26mm / (14 × 30 × 10)  =  81.68 / 4200  ≈ 0.01945 cm
+
+static void runDistanceTest() {
+    constexpr float kCmPerCount = (float)M_PI * ENCODER_WHEEL_DIAM_MM
+                                  / (float)(ENCODER_PPR * ENCODER_GEAR_RATIO * 10);
+    constexpr uint32_t kDurMs   = 5000;
+    constexpr uint16_t kSampleMs = 200;  // fenêtre de vitesse max
+
+    gDistTestActive = true;
+    gDistTestDone   = false;
+    TSLOG("[DistTest] START  PWM=255  duree=%ums", kDurMs);
+
+    // Reset compteurs
+    encLeft.resetCount();
+    encRight.resetCount();
+
+    float vmaxL = 0.0f, vmaxR = 0.0f;
+    int32_t prevL = 0, prevR = 0;
+    uint32_t tPrev = millis();
+
+    // Moteurs à fond – gauche miroir donc négatif
+    motorLeft.setSpeed(-MOTOR_PWM_MAX);
+    motorRight.setSpeed(MOTOR_PWM_MAX);
+
+    const uint32_t tStart = millis();
+    while (millis() - tStart < kDurMs) {
+        delay(kSampleMs);
+        encLeft.update();
+        encRight.update();
+
+        const int32_t cntL = encLeft.getCount();
+        const int32_t cntR = encRight.getCount();
+        const uint32_t tNow = millis();
+        const float dt = (tNow - tPrev) / 1000.0f;
+        tPrev = tNow;
+
+        // Vitesse instantanée sur la fenêtre (cm/s)
+        const float vL = fabsf((cntL - prevL) * kCmPerCount / dt);
+        const float vR = fabsf((cntR - prevR) * kCmPerCount / dt);
+        if (vL > vmaxL) vmaxL = vL;
+        if (vR > vmaxR) vmaxR = vR;
+        prevL = cntL;
+        prevR = cntR;
+    }
+
+    motorLeft.stop();
+    motorRight.stop();
+
+    encLeft.update();
+    encRight.update();
+
+    const float distL = fabsf(encLeft.getCount()  * kCmPerCount);
+    const float distR = fabsf(encRight.getCount() * kCmPerCount);
+
+    gDistTestL_cm  = distL;
+    gDistTestR_cm  = distR;
+    gDistTestVmax  = (vmaxL + vmaxR) * 0.5f;
+    gDistTestActive = false;
+    gDistTestDone   = true;
+
+    TSLOG("[DistTest] L=%.1fcm  R=%.1fcm  Vmax=%.1fcm/s", distL, distR, gDistTestVmax);
+}
+
 // ─── Loop ─────────────────────────────────────────────────────────────────────
 
 void loop() {
-    static int  testSpeed = 50;
-    static bool lastBtn   = HIGH;
+    static bool lastBtn = HIGH;
 
     const bool btn = digitalRead(PIN_BUTTON_1);
     if (btn == LOW && lastBtn == HIGH) {
         delay(20);
         if (digitalRead(PIN_BUTTON_1) == LOW) {
-            testSpeed = min(testSpeed + 25, 255);
-            TSLOG("[Btn] SPD=%d", testSpeed);
-            testMotors(testSpeed, 4000);
+            TSLOG("[Btn] Test distance 5s");
+            runDistanceTest();
         }
     }
     lastBtn = btn;
