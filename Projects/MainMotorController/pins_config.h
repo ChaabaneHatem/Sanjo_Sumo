@@ -22,8 +22,10 @@
 #define OLED2_I2C_ADDR  0x3D   // SSD1315 128×64 secondaire (SA0=VCC → 0x3D)
 #define INA219_I2C_ADDR 0x45  // DFRobot SEN0291 – A1=VCC, A0=VCC → 0x45
 
-// ─── Capteur ligne analogique ─────────────────────────────────────────────────
-#define PIN_LINE_SENSOR  34   // ADC1_CH6 – input only, pas de conflit WiFi
+// ─── Capteurs ligne analogiques (ADC1 uniquement – WiFi safe) ────────────────
+#define PIN_LINE_MID    34   // ADC1_CH6 – centre   – input only
+#define PIN_LINE_RIGHT  35   // ADC1_CH7 – droite   – input only
+#define PIN_LINE_LEFT   36   // ADC1_CH0 – gauche   – input only
 
 // ─── Encoders – N20 quadrature ───────────────────────────────────────────────
 // All four support INPUT_PULLUP (not input-only pins)

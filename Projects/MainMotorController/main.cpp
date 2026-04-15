@@ -65,7 +65,9 @@ static SemaphoreHandle_t gSerialMutex     = nullptr;
 
 static volatile uint16_t gTofDistMm[2]   = {0, 0};
 static volatile bool     gTofTimeout[2]  = {true, true};
-static volatile uint16_t gLineSensorRaw  = 0;
+static volatile uint16_t gLineMid   = 0;   // capteur ligne centre  (GPIO34)
+static volatile uint16_t gLineRight = 0;   // capteur ligne droite  (GPIO35)
+static volatile uint16_t gLineLeft  = 0;   // capteur ligne gauche  (GPIO36)
 static volatile float    gVelLeftCms     = 0.0f;  // vitesse roue gauche (cm/s, signée, repère robot)
 static volatile float    gVelRightCms    = 0.0f;  // vitesse roue droite (cm/s, signée)
 static volatile uint8_t  gDisplayMode    = 0;     // 0=données, 1=visage, 2=wattmètre
@@ -85,6 +87,7 @@ static volatile uint8_t  gGear          = 2;   // par défaut : 50%
 static volatile uint8_t  gSpeedPct      = 50;
 
 static volatile bool    gXboxConnected = false;   // suivi connexion Xbox (pour telemetrie TCP)
+static volatile uint8_t gRobotMode    = ROBOT_MODE_MANUAL;  // MANUAL ou AUTO
 
 // Convertit le pourcentage en valeur PWM [0, MOTOR_PWM_MAX]
 static inline int16_t hmiSpeed() {
@@ -128,6 +131,8 @@ static const BuzzerNote kSoundAttack[]      = {{880,35},{0,10},{1047,70}};
 static const BuzzerNote kSoundRetreat[]     = {{523,55},{0,10},{392,55},{0,10},{262,100}};
 static const BuzzerNote kSoundSpin[]        = {{700,40},{900,40},{700,40},{900,40},{1100,60}};
 static const BuzzerNote kSoundGear[]        = {{500,40}};  // pitch ajusté par gear
+static const BuzzerNote kSoundAutoOn[]      = {{600,60},{0,20},{800,60},{0,20},{1000,120}};
+static const BuzzerNote kSoundAutoOff[]     = {{1000,60},{0,20},{800,60},{0,20},{600,120}};
 
 // ─── TCA9548A mux – sélection de canal I2C ───────────────────────────────────
 
@@ -202,6 +207,23 @@ static void onXboxInput(const XboxState& s) {
     gXboxConnected = s.connected;
     if (gMotorTestActive) return;
 
+    // ── B : toggle MANUAL / AUTO ──────────────────────────────────────────────
+    static bool prevB = false;
+    if (s.btnB && !prevB) {
+        if (gRobotMode == ROBOT_MODE_MANUAL) {
+            gRobotMode = ROBOT_MODE_AUTO;
+            motorLeft.stop(); motorRight.stop();   // arrêt propre avant auto
+            buzzerMelody(kSoundAutoOn,  sizeof(kSoundAutoOn)  / sizeof(BuzzerNote));
+            TSLOG("[Mode] AUTO – évitement bordure actif");
+        } else {
+            gRobotMode = ROBOT_MODE_MANUAL;
+            motorLeft.stop(); motorRight.stop();
+            buzzerMelody(kSoundAutoOff, sizeof(kSoundAutoOff) / sizeof(BuzzerNote));
+            TSLOG("[Mode] MANUEL – contrôle Xbox");
+        }
+    }
+    prevB = s.btnB;
+
     // ── Y : switch interface OLED ──────────────────────────────────────────────
     static bool prevY = false;
     if (s.btnY && !prevY) {
@@ -212,16 +234,18 @@ static void onXboxInput(const XboxState& s) {
     }
     prevY = s.btnY;
 
-    // ── A : cycle vitesse ──────────────────────────────────────────────────────
+    // ── A : cycle vitesse (actif aussi en AUTO) ────────────────────────────────
     static bool prevA = false;
     if (s.btnA && !prevA) {
         gGear = (gGear + 1) % 6;
         gSpeedPct = kGears[gGear];
-        // pitch monte avec le gear (300 → 780 Hz)
         buzzerBeep((uint16_t)(300 + gGear * 80), 55);
         TSLOG("[Xbox] Gear %d/6  →  %d%%", (int)gGear + 1, (int)gSpeedPct);
     }
     prevA = s.btnA;
+
+    // ── En mode AUTO : Xbox ne contrôle pas les moteurs ───────────────────────
+    if (gRobotMode == ROBOT_MODE_AUTO) return;
 
     // ── Calcul vitesse roue gauche / droite ───────────────────────────────────
     // trigLT / trigRT : 10 bits → 0..1023  (maxTrig = 0x3FF)
@@ -356,18 +380,25 @@ static void pushTelemetry(WiFiClient& client) {
         client.println(line);
     }
 
-    // ── Ligne → avant_gauche ──────────────────────────────────────────────────
+    // ── Capteurs ligne (3 messages) ───────────────────────────────────────────
     {
+        static const struct { const char* nom; const volatile uint16_t* val; } kLines[3] = {
+            {"avant_gauche", &gLineLeft },
+            {"avant_centre", &gLineMid  },
+            {"avant_droite", &gLineRight},
+        };
         char buf[8];
-        doc.clear();
-        doc["type"]   = "ligne";
-        doc["nom"]    = "avant_gauche";
-        doc["brut"]   = (int)gLineSensorRaw;
-        snprintf(buf, sizeof(buf), "%u", gLineSensorRaw);
-        doc["traite"] = buf;
-        line = "";
-        serializeJson(doc, line);
-        client.println(line);
+        for (uint8_t i = 0; i < 3; i++) {
+            doc.clear();
+            doc["type"]   = "ligne";
+            doc["nom"]    = kLines[i].nom;
+            doc["brut"]   = (int)*kLines[i].val;
+            snprintf(buf, sizeof(buf), "%u", *kLines[i].val);
+            doc["traite"] = buf;
+            line = "";
+            serializeJson(doc, line);
+            client.println(line);
+        }
     }
 
     // ── Status général ────────────────────────────────────────────────────────
@@ -491,7 +522,10 @@ static void SensorTask(void*) {
               gTofDistMm[0], t0 ? "TIMEOUT" : "OK     ",
               gTofDistMm[1], t1 ? "TIMEOUT" : "OK     ");
 
-        gLineSensorRaw = (uint16_t)analogRead(PIN_LINE_SENSOR);
+        gLineMid   = (uint16_t)analogRead(PIN_LINE_MID);
+        gLineRight = (uint16_t)analogRead(PIN_LINE_RIGHT);
+        gLineLeft  = (uint16_t)analogRead(PIN_LINE_LEFT);
+        // Log désactivé (100Hz – trop de spam)
 
         vTaskDelay(pdMS_TO_TICKS(1000 / SENSOR_TASK_FREQ));
     }
@@ -509,6 +543,7 @@ static void oledDrawData(const XboxState& xs, float vL, float vR) {
     oled.setCursor(0, 0);
     oled.print(bleOk  ? "BLE:OK " : "BLE:-- ");
     oled.print(wifiOk ? "WiFi:OK" : "WiFi:--");
+    oled.print(gRobotMode == ROBOT_MODE_AUTO ? " [AUTO]" : " [MAN] ");
 
     oled.setCursor(0, 9);
     if (wifiOk) {
@@ -548,7 +583,7 @@ static void oledDrawData(const XboxState& xs, float vL, float vR) {
         oled.printf("T2:%4umm", gTofDistMm[1]);
 
     oled.setCursor(0, 53);
-    oled.printf("Ligne: %4u/4095", (unsigned)gLineSensorRaw);
+    oled.printf("G:%4u M:%4u D:%4u", (unsigned)gLineLeft, (unsigned)gLineMid, (unsigned)gLineRight);
 }
 
 // ─── OLED – mode 1 : visage ───────────────────────────────────────────────────
@@ -745,6 +780,122 @@ static void oledDrawWatt() {
     // Ligne 6 – tension shunt (debug)
     oled.setCursor(0, 58);
     oled.printf("Vsh  : %+6.2f mV", shuntMv);
+}
+
+// ─── Auto task – évitement bordure ───────────────────────────────────────────
+// Arena 77cm noire, bordure blanche 2.5cm.
+// Capteurs : gLineLeft(G36) | gLineMid(G34) | gLineRight(G35)
+// Ligne détectée si valeur ADC > LINE_THRESHOLD.
+//
+// Machine à états :
+//   FORWARD  → avance jusqu'à détection
+//   REVERSE  → recule 200ms
+//   TURN     → tourne en place 300ms (direction selon capteur qui a déclenché)
+
+static void AutoTask(void*) {
+    // États :
+    //   FORWARD  → avance droit
+    //   FOLLOW   → arc doux le long de la bordure (un côté détecté)
+    //   REVERSE  → recule si capteur milieu ou les deux côtés touchent
+    //   TURN     → tourne sur place après recul
+    enum class AutoState : uint8_t { FORWARD, FOLLOW, REVERSE, TURN };
+
+    AutoState state  = AutoState::FORWARD;
+    bool      turnCW = true;
+    uint32_t  stateMs = 0;
+
+    for (;;) {
+        if (gRobotMode != ROBOT_MODE_AUTO) {
+            state = AutoState::FORWARD;
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        // Vitesse recalculée à chaque cycle → btn A actif en AUTO
+        const int16_t fwdSpd  = (int16_t)(MOTOR_PWM_MAX * gSpeedPct / 100);
+        const int16_t turnSpd = (int16_t)(MOTOR_PWM_MAX * gSpeedPct / 100);
+        // Arc : roue intérieure ralentie à 30% de la roue extérieure
+        const int16_t arcFast = fwdSpd;
+        const int16_t arcSlow = (int16_t)(fwdSpd * 30 / 100);
+
+        // Bordure blanche = valeur BASSE
+        const bool lineL = gLineLeft  < LINE_THRESHOLD;
+        const bool lineM = gLineMid   < LINE_THRESHOLD;
+        const bool lineR = gLineRight < LINE_THRESHOLD;
+        const uint32_t now = millis();
+
+        switch (state) {
+            case AutoState::FORWARD:
+                if (lineM || (lineL && lineR)) {
+                    // Milieu ou les deux → recul
+                    turnCW = !turnCW;
+                    motorLeft.stop(); motorRight.stop();
+                    state = AutoState::REVERSE; stateMs = now;
+                } else if (lineL) {
+                    // Gauche touche la bordure → arc vers la droite (suivi CW)
+                    turnCW = true;
+                    state = AutoState::FOLLOW; stateMs = now;
+                } else if (lineR) {
+                    // Droite touche la bordure → arc vers la gauche (suivi CCW)
+                    turnCW = false;
+                    state = AutoState::FOLLOW; stateMs = now;
+                } else {
+                    // Aucune ligne → avance droit
+                    motorLeft.setSpeed(-fwdSpd);
+                    motorRight.setSpeed(fwdSpd);
+                }
+                break;
+
+            case AutoState::FOLLOW:
+                // Arc doux : reste tangent à la bordure
+                // Si la ligne disparaît ou s'aggrave → retour FORWARD ou REVERSE
+                if (lineM || (lineL && lineR)) {
+                    motorLeft.stop(); motorRight.stop();
+                    state = AutoState::REVERSE; stateMs = now;
+                } else if (!lineL && !lineR) {
+                    // Plus de bordure → reprend droit
+                    state = AutoState::FORWARD;
+                } else {
+                    if (turnCW) {
+                        // Arc droite : roue gauche rapide, droite lente
+                        motorLeft.setSpeed(-arcFast);
+                        motorRight.setSpeed(arcSlow);
+                    } else {
+                        // Arc gauche : roue droite rapide, gauche lente
+                        motorLeft.setSpeed(-arcSlow);
+                        motorRight.setSpeed(arcFast);
+                    }
+                }
+                break;
+
+            case AutoState::REVERSE:
+                if (now - stateMs < 250) {
+                    motorLeft.setSpeed(fwdSpd);
+                    motorRight.setSpeed(-fwdSpd);
+                } else {
+                    motorLeft.stop(); motorRight.stop();
+                    state = AutoState::TURN; stateMs = now;
+                }
+                break;
+
+            case AutoState::TURN:
+                if (now - stateMs < 400) {
+                    if (turnCW) {
+                        motorLeft.setSpeed(-turnSpd);
+                        motorRight.setSpeed(-turnSpd);
+                    } else {
+                        motorLeft.setSpeed(turnSpd);
+                        motorRight.setSpeed(turnSpd);
+                    }
+                } else {
+                    motorLeft.stop(); motorRight.stop();
+                    state = AutoState::FORWARD;
+                }
+                break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000 / AUTO_TASK_FREQ));
+    }
 }
 
 // ─── Watt task – 2 Hz ────────────────────────────────────────────────────────
@@ -1016,9 +1167,10 @@ void setup() {
     ledcWrite(BUZZER_LEDC_CHANNEL, 0);
     Serial.printf("[Buzz]  GPIO%d  canal LEDC %d\n", PIN_BUZZER, BUZZER_LEDC_CHANNEL);
 
-    // ── Capteur ligne ─────────────────────────────────────────────────────────
+    // ── Capteurs ligne ────────────────────────────────────────────────────────
     analogReadResolution(12);
-    Serial.printf("[Ligne] GPIO%d  ADC 12-bit\n", PIN_LINE_SENSOR);
+    Serial.printf("[Ligne] MID=GPIO%d  RIGHT=GPIO%d  LEFT=GPIO%d  ADC 12-bit\n",
+                  PIN_LINE_MID, PIN_LINE_RIGHT, PIN_LINE_LEFT);
 
     // ── Xbox BLE (démarré avant WiFi) ─────────────────────────────────────────
     xbox.begin(onXboxInput);
@@ -1052,6 +1204,7 @@ void setup() {
     xTaskCreatePinnedToCore(StatusTask,  "StatusTask",  2048, nullptr, 1, nullptr, 0);
     xTaskCreatePinnedToCore(WattTask,    "WattTask",    2048, nullptr, 1, nullptr, 0);
     xTaskCreatePinnedToCore(OledTask,    "OledTask",    5120, nullptr, 1, nullptr, 0);
+    xTaskCreatePinnedToCore(AutoTask,    "AutoTask",    2048, nullptr, 2, nullptr, 1);
     Serial.println("[Tasks] Demarre");
 
     Serial.println("[Setup] Pret\n");
