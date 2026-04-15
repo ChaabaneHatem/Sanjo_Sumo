@@ -31,6 +31,10 @@
 #define LINE_THRESHOLD     800    // valeur en-dessous = bordure blanche détectée
 #define AUTO_TASK_FREQ     20     // Hz – boucle auto (50ms/cycle)
 #define AUTO_SPEED_PCT     50     // % vitesse avance en auto
+#define AUTO_REVERSE_MS   500    // durée recul après bord détecté (ms)
+#define AUTO_TURN_MS      700    // durée pivot après recul (ms)
+#define TOF_ATTACK_MM     400    // distance adversaire → ATTAQUE (mm)
+#define TOF_LOST_MM       600    // adversaire perdu → RECHERCHE (mm)
 
 // ─── WiFi / TCP (Lab 1) ───────────────────────────────────────────────────────
 #define WIFI_SSID  "sanjo"

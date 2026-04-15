@@ -87,7 +87,11 @@ static volatile uint8_t  gGear          = 2;   // par défaut : 50%
 static volatile uint8_t  gSpeedPct      = 50;
 
 static volatile bool    gXboxConnected = false;   // suivi connexion Xbox (pour telemetrie TCP)
-static volatile uint8_t gRobotMode    = ROBOT_MODE_MANUAL;  // MANUAL ou AUTO
+static volatile uint8_t  gRobotMode   = ROBOT_MODE_MANUAL;  // MANUAL ou AUTO
+
+// États FSM combat (lisible par OLED/TCP)
+enum EtatCombat : uint8_t { COMBAT_ARRET, COMBAT_RECHERCHE, COMBAT_ATTAQUE, COMBAT_DEFENSE };
+static volatile EtatCombat gEtatCombat = COMBAT_ARRET;
 
 // Convertit le pourcentage en valeur PWM [0, MOTOR_PWM_MAX]
 static inline int16_t hmiSpeed() {
@@ -782,118 +786,195 @@ static void oledDrawWatt() {
     oled.printf("Vsh  : %+6.2f mV", shuntMv);
 }
 
-// ─── Auto task – évitement bordure ───────────────────────────────────────────
-// Arena 77cm noire, bordure blanche 2.5cm.
-// Capteurs : gLineLeft(G36) | gLineMid(G34) | gLineRight(G35)
-// Ligne détectée si valeur ADC > LINE_THRESHOLD.
-//
-// Machine à états :
-//   FORWARD  → avance jusqu'à détection
-//   REVERSE  → recule 200ms
-//   TURN     → tourne en place 300ms (direction selon capteur qui a déclenché)
+// ─── Pattern Strategy – Labo 6 ───────────────────────────────────────────────
+// Wrapper moteurs (miroir gauche compensé)
+struct Bot {
+    static void avancer(int v)    { motorLeft.setSpeed(-(int16_t)v); motorRight.setSpeed((int16_t)v); }
+    static void reculer(int v)    { motorLeft.setSpeed((int16_t)v);  motorRight.setSpeed(-(int16_t)v); }
+    static void pivoterCW(int v)  { motorLeft.setSpeed(-(int16_t)v); motorRight.setSpeed(-(int16_t)v); }
+    static void pivoterCCW(int v) { motorLeft.setSpeed((int16_t)v);  motorRight.setSpeed((int16_t)v); }
+    static void arreter()         { motorLeft.stop(); motorRight.stop(); }
+};
+
+class IStrategieRobot {
+public:
+    virtual ~IStrategieRobot() = default;
+    virtual void demarrer()    = 0;
+    virtual void mettreAJour() = 0;
+    virtual void arreter()     = 0;
+    virtual bool estTerminee() = 0;
+    virtual const char* nom()  = 0;
+};
+
+// Attaque : fonce à pleine vitesse vers l'adversaire
+class StrategieCharge : public IStrategieRobot {
+    uint32_t _debut = 0;
+    bool     _done  = false;
+public:
+    void demarrer() override {
+        _debut = millis(); _done = false;
+        Bot::avancer(MOTOR_PWM_MAX);
+    }
+    void mettreAJour() override {
+        if (millis() - _debut >= 2000) { Bot::arreter(); _done = true; }
+    }
+    void arreter()     override { Bot::arreter(); _done = true; }
+    bool estTerminee() override { return _done; }
+    const char* nom()  override { return "Charge"; }
+};
+
+// Recherche : tourne sur place jusqu'à détection adversaire
+class StrategieRotation : public IStrategieRobot {
+    bool _done = false;
+public:
+    void demarrer() override { _done = false; Bot::pivoterCW(MOTOR_PWM_MAX * 50 / 100); }
+    void mettreAJour() override {}   // FSM interrompt si adversaire détecté
+    void arreter()     override { Bot::arreter(); _done = true; }
+    bool estTerminee() override { return _done; }
+    const char* nom()  override { return "Rotation"; }
+};
+
+// Défense : recule pleine vitesse puis pivote 180°
+class StrategieRecul : public IStrategieRobot {
+    enum Phase { RECUL, PIVOT, FIN } _phase = RECUL;
+    uint32_t _t = 0;
+public:
+    void demarrer() override {
+        _phase = RECUL; _t = millis();
+        Bot::reculer(MOTOR_PWM_MAX);
+    }
+    void mettreAJour() override {
+        const uint32_t dt = millis() - _t;
+        if (_phase == RECUL && dt >= AUTO_REVERSE_MS) {
+            _phase = PIVOT; _t = millis();
+            Bot::pivoterCW(MOTOR_PWM_MAX * 80 / 100);
+        } else if (_phase == PIVOT && dt >= AUTO_TURN_MS) {
+            Bot::arreter(); _phase = FIN;
+        }
+    }
+    void arreter()     override { Bot::arreter(); _phase = FIN; }
+    bool estTerminee() override { return _phase == FIN; }
+    const char* nom()  override { return "Recul"; }
+};
+
+// Défense : recule en biais selon le côté du bord détecté
+class StrategieEvitement : public IStrategieRobot {
+    bool     _coteG;
+    bool     _done = false;
+    uint32_t _t    = 0;
+public:
+    explicit StrategieEvitement(bool coteGauche) : _coteG(coteGauche) {}
+    void demarrer() override {
+        _done = false; _t = millis();
+        if (_coteG) {
+            // Bord gauche → recule en virant droite
+            motorLeft.setSpeed((int16_t)MOTOR_PWM_MAX);
+            motorRight.setSpeed(-(int16_t)(MOTOR_PWM_MAX * 40 / 100));
+        } else {
+            // Bord droit → recule en virant gauche
+            motorLeft.setSpeed((int16_t)(MOTOR_PWM_MAX * 40 / 100));
+            motorRight.setSpeed(-(int16_t)MOTOR_PWM_MAX);
+        }
+    }
+    void mettreAJour() override {
+        if (millis() - _t >= AUTO_REVERSE_MS) { Bot::arreter(); _done = true; }
+    }
+    void arreter()     override { Bot::arreter(); _done = true; }
+    bool estTerminee() override { return _done; }
+    const char* nom()  override { return "Evitement"; }
+};
+
+// ─── ControleurCombat – FSM Labo 6 ───────────────────────────────────────────
+// Priorités : DEFENSE (bord) > ATTAQUE (ToF < 400mm) > RECHERCHE
+
+class ControleurCombat {
+    IStrategieRobot* _strat = nullptr;
+    EtatCombat       _etat  = COMBAT_ARRET;
+
+    void changerStrategie(IStrategieRobot* nouvelle) {
+        if (_strat) { _strat->arreter(); delete _strat; }
+        _strat = nouvelle;
+        if (_strat) _strat->demarrer();
+        gEtatCombat = _etat;
+    }
+
+public:
+    ~ControleurCombat() { arreterCombat(); }
+
+    void demarrer() {
+        _etat = COMBAT_RECHERCHE;
+        changerStrategie(new StrategieRotation());
+        TSLOG("[Combat] START → RECHERCHE");
+    }
+
+    void arreterCombat() {
+        if (_strat) { _strat->arreter(); delete _strat; _strat = nullptr; }
+        Bot::arreter();
+        _etat = COMBAT_ARRET;
+        gEtatCombat = COMBAT_ARRET;
+    }
+
+    void mettreAJour() {
+        if (_etat == COMBAT_ARRET || !_strat) return;
+
+        // Capteurs ligne – blanc = basse valeur
+        const bool bordL = gLineLeft  < LINE_THRESHOLD;
+        const bool bordM = gLineMid   < LINE_THRESHOLD;
+        const bool bordR = gLineRight < LINE_THRESHOLD;
+        const bool bord  = bordL || bordM || bordR;
+
+        // ToF[0] = seul capteur fonctionnel (avant)
+        const bool tofOk      = !gTofTimeout[0];
+        const bool adversaire = tofOk && gTofDistMm[0] < TOF_ATTACK_MM;
+        const bool perdu      = !tofOk || gTofDistMm[0] > TOF_LOST_MM;
+
+        // Priorité 1 – bord détecté → DEFENSE (prime sur tout)
+        if (bord && _etat != COMBAT_DEFENSE) {
+            const bool coteG = bordL || (bordM && !bordR);
+            _etat = COMBAT_DEFENSE;
+            changerStrategie(new StrategieEvitement(coteG));
+            TSLOG("[Combat] DEFENSE %s  L:%d M:%d R:%d", coteG ? "G" : "D", bordL, bordM, bordR);
+        }
+        // Priorité 2 – adversaire détecté → ATTAQUE
+        else if (adversaire && _etat == COMBAT_RECHERCHE) {
+            _etat = COMBAT_ATTAQUE;
+            changerStrategie(new StrategieCharge());
+            TSLOG("[Combat] ATTAQUE  tof=%umm", gTofDistMm[0]);
+        }
+        // Priorité 3 – adversaire perdu en attaque → RECHERCHE
+        else if (perdu && _etat == COMBAT_ATTAQUE) {
+            _etat = COMBAT_RECHERCHE;
+            changerStrategie(new StrategieRotation());
+            TSLOG("[Combat] RECHERCHE (perdu)");
+        }
+        // Priorité 4 – défense terminée → RECHERCHE
+        else if (_etat == COMBAT_DEFENSE && _strat->estTerminee()) {
+            _etat = COMBAT_RECHERCHE;
+            changerStrategie(new StrategieRotation());
+            TSLOG("[Combat] RECHERCHE (dégagé)");
+        }
+
+        _strat->mettreAJour();
+    }
+
+    EtatCombat  etat()     const { return _etat; }
+    const char* nomStrat() const { return _strat ? _strat->nom() : "aucune"; }
+};
+
+// ─── Auto task ────────────────────────────────────────────────────────────────
 
 static void AutoTask(void*) {
-    // États :
-    //   FORWARD  → avance droit
-    //   FOLLOW   → arc doux le long de la bordure (un côté détecté)
-    //   REVERSE  → recule si capteur milieu ou les deux côtés touchent
-    //   TURN     → tourne sur place après recul
-    enum class AutoState : uint8_t { FORWARD, FOLLOW, REVERSE, TURN };
-
-    AutoState state  = AutoState::FORWARD;
-    bool      turnCW = true;
-    uint32_t  stateMs = 0;
+    ControleurCombat combat;
+    bool wasActive = false;
 
     for (;;) {
         if (gRobotMode != ROBOT_MODE_AUTO) {
-            state = AutoState::FORWARD;
+            if (wasActive) { combat.arreterCombat(); wasActive = false; }
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
-
-        // Vitesse recalculée à chaque cycle → btn A actif en AUTO
-        const int16_t fwdSpd  = (int16_t)(MOTOR_PWM_MAX * gSpeedPct / 100);
-        const int16_t turnSpd = (int16_t)(MOTOR_PWM_MAX * gSpeedPct / 100);
-        // Arc : roue intérieure ralentie à 30% de la roue extérieure
-        const int16_t arcFast = fwdSpd;
-        const int16_t arcSlow = (int16_t)(fwdSpd * 30 / 100);
-
-        // Bordure blanche = valeur BASSE
-        const bool lineL = gLineLeft  < LINE_THRESHOLD;
-        const bool lineM = gLineMid   < LINE_THRESHOLD;
-        const bool lineR = gLineRight < LINE_THRESHOLD;
-        const uint32_t now = millis();
-
-        switch (state) {
-            case AutoState::FORWARD:
-                if (lineM || (lineL && lineR)) {
-                    // Milieu ou les deux → recul
-                    turnCW = !turnCW;
-                    motorLeft.stop(); motorRight.stop();
-                    state = AutoState::REVERSE; stateMs = now;
-                } else if (lineL) {
-                    // Gauche touche la bordure → arc vers la droite (suivi CW)
-                    turnCW = true;
-                    state = AutoState::FOLLOW; stateMs = now;
-                } else if (lineR) {
-                    // Droite touche la bordure → arc vers la gauche (suivi CCW)
-                    turnCW = false;
-                    state = AutoState::FOLLOW; stateMs = now;
-                } else {
-                    // Aucune ligne → avance droit
-                    motorLeft.setSpeed(-fwdSpd);
-                    motorRight.setSpeed(fwdSpd);
-                }
-                break;
-
-            case AutoState::FOLLOW:
-                // Arc doux : reste tangent à la bordure
-                // Si la ligne disparaît ou s'aggrave → retour FORWARD ou REVERSE
-                if (lineM || (lineL && lineR)) {
-                    motorLeft.stop(); motorRight.stop();
-                    state = AutoState::REVERSE; stateMs = now;
-                } else if (!lineL && !lineR) {
-                    // Plus de bordure → reprend droit
-                    state = AutoState::FORWARD;
-                } else {
-                    if (turnCW) {
-                        // Arc droite : roue gauche rapide, droite lente
-                        motorLeft.setSpeed(-arcFast);
-                        motorRight.setSpeed(arcSlow);
-                    } else {
-                        // Arc gauche : roue droite rapide, gauche lente
-                        motorLeft.setSpeed(-arcSlow);
-                        motorRight.setSpeed(arcFast);
-                    }
-                }
-                break;
-
-            case AutoState::REVERSE:
-                if (now - stateMs < 250) {
-                    motorLeft.setSpeed(fwdSpd);
-                    motorRight.setSpeed(-fwdSpd);
-                } else {
-                    motorLeft.stop(); motorRight.stop();
-                    state = AutoState::TURN; stateMs = now;
-                }
-                break;
-
-            case AutoState::TURN:
-                if (now - stateMs < 400) {
-                    if (turnCW) {
-                        motorLeft.setSpeed(-turnSpd);
-                        motorRight.setSpeed(-turnSpd);
-                    } else {
-                        motorLeft.setSpeed(turnSpd);
-                        motorRight.setSpeed(turnSpd);
-                    }
-                } else {
-                    motorLeft.stop(); motorRight.stop();
-                    state = AutoState::FORWARD;
-                }
-                break;
-        }
-
+        if (!wasActive) { combat.demarrer(); wasActive = true; }
+        combat.mettreAJour();
         vTaskDelay(pdMS_TO_TICKS(1000 / AUTO_TASK_FREQ));
     }
 }
