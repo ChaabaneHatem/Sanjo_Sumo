@@ -62,6 +62,7 @@ static volatile float gDistTestL_cm   = 0.0f;   // distance roue gauche (cm)
 static volatile float gDistTestR_cm   = 0.0f;   // distance roue droite (cm)
 static volatile float gDistTestVmax   = 0.0f;   // vitesse max mesurée (cm/s)
 static SemaphoreHandle_t gSerialMutex     = nullptr;
+static SemaphoreHandle_t gI2cMutex        = nullptr;  // protège Wire (ToF + OLED + INA219)
 
 static volatile uint16_t gTofDistMm[2]   = {0, 0};
 static volatile bool     gTofTimeout[2]  = {true, true};
@@ -517,35 +518,86 @@ static void EncoderTask(void*) {
     }
 }
 
-// ─── Sensor task – 2 Hz ──────────────────────────────────────────────────────
+// ─── ToF task – 2 Hz (I2C séparé des ADC ligne) ──────────────────────────────
+// Séparé du LineSensorTask pour éviter que les blocages I2C affectent
+// la détection de ligne (et inversement).
 
-static void SensorTask(void*) {
-    vTaskDelay(pdMS_TO_TICKS(333));
+// Réinitialise les deux capteurs VL53L0X sous le mutex I2C.
+// Appelé après TOF_REINIT_THRESH cycles consécutifs de timeout.
+static void tofReinit() {
+    TSLOG("[ToF]  REINIT – bus I2C corrompu, réinitialisation capteurs...");
+    for (uint8_t i = 0; i < 2; i++) {
+        tcaSelect(i);
+        vTaskDelay(pdMS_TO_TICKS(5));
+        if (tof[i].init()) {
+            tof[i].setMeasurementTimingBudget(20000);
+            tof[i].startContinuous(20);
+            TSLOG("[ToF]  #%d réinitialisé OK", i + 1);
+        } else {
+            TSLOG("[ToF]  #%d ERREUR reinit", i + 1);
+        }
+    }
+}
+
+static void ToFTask(void*) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+    static constexpr uint8_t TOF_REINIT_THRESH = 5;  // 5 × 25ms = 125ms de timeout → reinit
+    uint8_t consecutiveTimeouts = 0;
+
     for (;;) {
-        // -- ToF #1 (TCA canal 0) ---------------------------------------------
-        tcaSelect(0);
-        uint16_t d0 = tof[0].readRangeContinuousMillimeters();
-        bool     t0 = tof[0].timeoutOccurred();
+        uint16_t d0 = 0, d1 = 0;
+        bool     t0 = true, t1 = true;
+
+        if (xSemaphoreTake(gI2cMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            // Canal 0
+            tcaSelect(0);
+            d0 = tof[0].readRangeContinuousMillimeters();
+            t0 = tof[0].timeoutOccurred();
+
+            // Canal 1
+            tcaSelect(1);
+            d1 = tof[1].readRangeContinuousMillimeters();
+            t1 = tof[1].timeoutOccurred();
+
+            xSemaphoreGive(gI2cMutex);
+        }
+
         gTofDistMm[0]  = t0 ? 0 : d0;
         gTofTimeout[0] = t0;
-
-        // -- ToF #2 (TCA canal 1) ---------------------------------------------
-        tcaSelect(1);
-        uint16_t d1 = tof[1].readRangeContinuousMillimeters();
-        bool     t1 = tof[1].timeoutOccurred();
         gTofDistMm[1]  = t1 ? 0 : d1;
         gTofTimeout[1] = t1;
+
+        // Récupération sur timeout persistant (bruit I2C des moteurs)
+        if (t0 && t1) {
+            consecutiveTimeouts++;
+            if (consecutiveTimeouts >= TOF_REINIT_THRESH) {
+                consecutiveTimeouts = 0;
+                if (xSemaphoreTake(gI2cMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+                    tofReinit();
+                    xSemaphoreGive(gI2cMutex);
+                }
+            }
+        } else {
+            consecutiveTimeouts = 0;
+        }
 
         TSLOG("[Sensor] ToF#1=%4umm %s  ToF#2=%4umm %s",
               gTofDistMm[0], t0 ? "TIMEOUT" : "OK     ",
               gTofDistMm[1], t1 ? "TIMEOUT" : "OK     ");
 
+        vTaskDelay(pdMS_TO_TICKS(25));   // 40 Hz – mesure prête toutes les 20ms, on lit à 25ms
+    }
+}
+
+// ─── Line sensor task – 100 Hz (ADC seulement, pas d'I2C) ────────────────────
+
+static void SensorTask(void*) {
+    vTaskDelay(pdMS_TO_TICKS(333));
+    for (;;) {
         gLineMid   = (uint16_t)analogRead(PIN_LINE_MID);
         gLineRight = (uint16_t)analogRead(PIN_LINE_RIGHT);
         gLineLeft  = (uint16_t)analogRead(PIN_LINE_LEFT);
-        // Log désactivé (100Hz – trop de spam)
-
-        vTaskDelay(pdMS_TO_TICKS(1000 / SENSOR_TASK_FREQ));
+        vTaskDelay(pdMS_TO_TICKS(1000 / SENSOR_TASK_FREQ));  // 10ms = 100Hz
     }
 }
 
@@ -1000,9 +1052,11 @@ static void WattTask(void*) {
     uint32_t lastMs = millis();
 
     for (;;) {
-        if (gInaOk) {
+        if (gInaOk && xSemaphoreTake(gI2cMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             const float shuntMv  = ina219.getShuntVoltage_mV();
             const float busV     = ina219.getBusVoltage_V();
+            xSemaphoreGive(gI2cMutex);
+
             // Shunt 10 mΩ : I(mA) = Vshunt(mV) / 0.010 Ω / 1000 = Vshunt(mV) × 100
             const float currentMa = shuntMv * 100.0f;
             const float powerMw   = busV * currentMa;
@@ -1046,9 +1100,12 @@ static void OledTask(void*) {
             oled.setCursor(16, 10);  oled.print("TEST DISTANCE");
             oled.setCursor(28, 24);  oled.print("EN COURS...");
             oled.setCursor(20, 38);  oled.print("5 secondes @ 100%");
-            oled.display();
-            memcpy(oled2.getBuffer(), oled.getBuffer(), 128 * 64 / 8);
-            oled2.display();
+            if (xSemaphoreTake(gI2cMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                oled.display();
+                memcpy(oled2.getBuffer(), oled.getBuffer(), 128 * 64 / 8);
+                oled2.display();
+                xSemaphoreGive(gI2cMutex);
+            }
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
@@ -1067,9 +1124,12 @@ static void OledTask(void*) {
                 oled.drawFastHLine(0, 45, 128, SSD1306_WHITE);
                 oled.setCursor(0, 48);   oled.printf("Vmax   : %6.1f cm/s", gDistTestVmax);
                 oled.setCursor(0, 57);   oled.printf("Vtheo  :  ~101.0 cm/s");
-                oled.display();
-                memcpy(oled2.getBuffer(), oled.getBuffer(), 128 * 64 / 8);
-                oled2.display();
+                if (xSemaphoreTake(gI2cMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    oled.display();
+                    memcpy(oled2.getBuffer(), oled.getBuffer(), 128 * 64 / 8);
+                    oled2.display();
+                    xSemaphoreGive(gI2cMutex);
+                }
                 vTaskDelay(pdMS_TO_TICKS(200));
                 continue;
             }
@@ -1134,10 +1194,13 @@ static void OledTask(void*) {
             oledDrawWatt();
         }
 
-        oled.display();
-        // Miroir sur le second écran : copie le buffer pixel-par-pixel
-        memcpy(oled2.getBuffer(), oled.getBuffer(), 128 * 64 / 8);
-        oled2.display();
+        if (xSemaphoreTake(gI2cMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            oled.display();
+            // Miroir sur le second écran : copie le buffer pixel-par-pixel
+            memcpy(oled2.getBuffer(), oled.getBuffer(), 128 * 64 / 8);
+            oled2.display();
+            xSemaphoreGive(gI2cMutex);
+        }
         vTaskDelay(pdMS_TO_TICKS(1000 / OLED_TASK_FREQ));
     }
 }
@@ -1183,6 +1246,7 @@ void setup() {
     Serial.begin(115200);
     delay(300);
     gSerialMutex = xSemaphoreCreateMutex();
+    gI2cMutex    = xSemaphoreCreateMutex();
 
     Serial.println("\n[Setup] Sanjo Sumo – Phase 1");
 
@@ -1240,11 +1304,12 @@ void setup() {
     for (uint8_t i = 0; i < 2; i++) {
         tcaSelect(i);
         delay(10);
-        tof[i].setTimeout(500);
+        tof[i].setTimeout(25);   // timeout court → jamais bloquant plus de 25ms
         if (!tof[i].init()) {
             Serial.printf("[ToF]   #%d ERREUR (TCA canal %d)\n", i + 1, i);
         } else {
-            tof[i].startContinuous();
+            tof[i].setMeasurementTimingBudget(20000);  // 20ms = 50Hz max
+            tof[i].startContinuous(20);                // nouvelle mesure toutes les 20ms
             Serial.printf("[ToF]   #%d OK     (TCA canal %d)\n", i + 1, i);
         }
     }
@@ -1295,11 +1360,12 @@ void setup() {
     }
     xTaskCreatePinnedToCore(BuzzerTask,  "BuzzerTask",  2048, nullptr, 2, nullptr, 0);
     xTaskCreatePinnedToCore(EncoderTask, "EncoderTask", 2048, nullptr, 1, nullptr, 0);
-    xTaskCreatePinnedToCore(SensorTask,  "SensorTask",  3072, nullptr, 1, nullptr, 0);
+    xTaskCreatePinnedToCore(ToFTask,     "ToFTask",     2048, nullptr, 1, nullptr, 0);  // I2C 2Hz
+    xTaskCreatePinnedToCore(SensorTask,  "SensorTask",  2048, nullptr, 2, nullptr, 0);  // ADC 100Hz
     xTaskCreatePinnedToCore(StatusTask,  "StatusTask",  2048, nullptr, 1, nullptr, 0);
     xTaskCreatePinnedToCore(WattTask,    "WattTask",    2048, nullptr, 1, nullptr, 0);
     xTaskCreatePinnedToCore(OledTask,    "OledTask",    5120, nullptr, 1, nullptr, 0);
-    xTaskCreatePinnedToCore(AutoTask,    "AutoTask",    2048, nullptr, 2, nullptr, 1);
+    xTaskCreatePinnedToCore(AutoTask,    "AutoTask",    3072, nullptr, 2, nullptr, 1);  // +1024 pour ControleurCombat+strategies
     Serial.println("[Tasks] Demarre");
 
     Serial.println("[Setup] Pret\n");

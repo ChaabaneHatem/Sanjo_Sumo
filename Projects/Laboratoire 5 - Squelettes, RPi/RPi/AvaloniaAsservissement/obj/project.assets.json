@@ -2046,19 +2046,19 @@
     ]
   },
   "packageFolders": {
-    "C:\\Users\\Steve\\.nuget\\packages\\": {}
+    "C:\\Users\\User\\.nuget\\packages\\": {}
   },
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "C:\\Users\\Steve\\Desktop\\POO GEI1076\\Laboratoire 5 - Squelettes, RPi\\RPi\\AvaloniaAsservissement\\AvaloniaAsservissement.csproj",
+      "projectUniqueName": "C:\\Users\\User\\Documents\\PlatformIO\\Projects\\Sanjo_Sumo\\Projects\\Laboratoire 5 - Squelettes, RPi\\RPi\\AvaloniaAsservissement\\AvaloniaAsservissement.csproj",
       "projectName": "AvaloniaAsservissement",
-      "projectPath": "C:\\Users\\Steve\\Desktop\\POO GEI1076\\Laboratoire 5 - Squelettes, RPi\\RPi\\AvaloniaAsservissement\\AvaloniaAsservissement.csproj",
-      "packagesPath": "C:\\Users\\Steve\\.nuget\\packages\\",
-      "outputPath": "C:\\Users\\Steve\\Desktop\\POO GEI1076\\Laboratoire 5 - Squelettes, RPi\\RPi\\AvaloniaAsservissement\\obj\\",
+      "projectPath": "C:\\Users\\User\\Documents\\PlatformIO\\Projects\\Sanjo_Sumo\\Projects\\Laboratoire 5 - Squelettes, RPi\\RPi\\AvaloniaAsservissement\\AvaloniaAsservissement.csproj",
+      "packagesPath": "C:\\Users\\User\\.nuget\\packages\\",
+      "outputPath": "C:\\Users\\User\\Documents\\PlatformIO\\Projects\\Sanjo_Sumo\\Projects\\Laboratoire 5 - Squelettes, RPi\\RPi\\AvaloniaAsservissement\\obj\\",
       "projectStyle": "PackageReference",
       "configFilePaths": [
-        "C:\\Users\\Steve\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        "C:\\Users\\User\\AppData\\Roaming\\NuGet\\NuGet.Config"
       ],
       "originalTargetFrameworks": [
         "net8.0"
@@ -2081,7 +2081,8 @@
         "enableAudit": "true",
         "auditLevel": "low",
         "auditMode": "direct"
-      }
+      },
+      "SdkAnalysisLevel": "9.0.200"
     },
     "frameworks": {
       "net8.0": {
@@ -2113,28 +2114,44 @@
         "warn": true,
         "downloadDependencies": [
           {
+            "name": "Microsoft.AspNetCore.App.Ref",
+            "version": "[8.0.17, 8.0.17]"
+          },
+          {
             "name": "Microsoft.AspNetCore.App.Runtime.linux-arm64",
-            "version": "[8.0.25, 8.0.25]"
+            "version": "[8.0.17, 8.0.17]"
           },
           {
             "name": "Microsoft.AspNetCore.App.Runtime.win-x64",
-            "version": "[8.0.25, 8.0.25]"
+            "version": "[8.0.17, 8.0.17]"
           },
           {
             "name": "Microsoft.NETCore.App.Host.linux-arm64",
-            "version": "[8.0.25, 8.0.25]"
+            "version": "[8.0.17, 8.0.17]"
+          },
+          {
+            "name": "Microsoft.NETCore.App.Host.win-x64",
+            "version": "[8.0.17, 8.0.17]"
+          },
+          {
+            "name": "Microsoft.NETCore.App.Ref",
+            "version": "[8.0.17, 8.0.17]"
           },
           {
             "name": "Microsoft.NETCore.App.Runtime.linux-arm64",
-            "version": "[8.0.25, 8.0.25]"
+            "version": "[8.0.17, 8.0.17]"
           },
           {
             "name": "Microsoft.NETCore.App.Runtime.win-x64",
-            "version": "[8.0.25, 8.0.25]"
+            "version": "[8.0.17, 8.0.17]"
+          },
+          {
+            "name": "Microsoft.WindowsDesktop.App.Ref",
+            "version": "[8.0.17, 8.0.17]"
           },
           {
             "name": "Microsoft.WindowsDesktop.App.Runtime.win-x64",
-            "version": "[8.0.25, 8.0.25]"
+            "version": "[8.0.17, 8.0.17]"
           }
         ],
         "frameworkReferences": {
@@ -2142,7 +2159,7 @@
             "privateAssets": "all"
           }
         },
-        "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.419/PortableRuntimeIdentifierGraph.json"
+        "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\9.0.205/PortableRuntimeIdentifierGraph.json"
       }
     },
     "runtimes": {

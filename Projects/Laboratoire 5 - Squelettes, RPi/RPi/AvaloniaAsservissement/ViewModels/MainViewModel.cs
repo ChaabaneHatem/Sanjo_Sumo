@@ -369,13 +369,10 @@ namespace AvaloniaAsservissement.ViewModels
 
                     var trimmed = json.Trim();
                     var lecture = LectureCapteur.DepuisJson(trimmed);
-                    if (lecture != null)
-                    {
-                        if (lecture.Type == "ligne")
-                            await Dispatcher.UIThread.InvokeAsync(() => AppliquerLigne(lecture));
-                        else if (lecture.Type == "tof")
-                            await Dispatcher.UIThread.InvokeAsync(() => AppliquerTof(lecture));
-                    }
+                    if (lecture != null && lecture.Type == "ligne")
+                        await Dispatcher.UIThread.InvokeAsync(() => AppliquerLigne(lecture));
+                    else if (lecture != null && lecture.Type == "tof")
+                        await Dispatcher.UIThread.InvokeAsync(() => AppliquerTof(lecture));
                     else
                     {
                         var status = LectureStatus.DepuisJson(trimmed);
