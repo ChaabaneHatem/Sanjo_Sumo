@@ -336,8 +336,22 @@ static String handleCommand(const String& json) {
 
     } else if (strcmp(cmd, "arreter") == 0 || strcmp(cmd, "urgence") == 0) {
         TSLOG("[Cmd] %s", cmd);
+        gRobotMode = ROBOT_MODE_MANUAL;
         motorLeft.stop();
         motorRight.stop();
+
+    } else if (strcmp(cmd, "suivre_ligne") == 0) {
+        TSLOG("[Cmd] suivre_ligne → MODE AUTO");
+        motorLeft.stop(); motorRight.stop();
+        gRobotMode = ROBOT_MODE_AUTO;
+        buzzerMelody(kSoundAutoOn, sizeof(kSoundAutoOn) / sizeof(BuzzerNote));
+
+    } else if (strcmp(cmd, "tuning") == 0) {
+        // Paramètres reçus du RPi – réservé pour asservissement PD
+        TSLOG("[Cmd] tuning kp=%.1f kd=%.1f vbase=%d vmin=%d vmax=%d seuil=%d",
+              doc["kp"].as<float>(), doc["kd"].as<float>(),
+              doc["vbase"].as<int>(), doc["vmin"].as<int>(),
+              doc["vmax"].as<int>(), doc["seuil"].as<int>());
 
     } else if (strcmp(cmd, "set_vitesse") == 0) {
         gSpeedPct = (uint8_t)constrain(doc["valeur"].as<int>(), 0, 100);
