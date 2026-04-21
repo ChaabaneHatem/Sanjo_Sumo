@@ -18,13 +18,14 @@
  */
 
 #include <Arduino.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include "esp_system.h"
 #include <WiFi.h>
 #include <WiFiServer.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <VL53L0X.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 #include <Adafruit_INA219.h>
 
 #include "main.h"
@@ -45,10 +46,8 @@ XboxController xbox("74:c4:12:b1:c0:3a");  // Xbox Series X – adresse BLE fixe
 Encoder encLeft (ENC_A_C1, ENC_A_C2, 0);
 Encoder encRight(ENC_B_C1, ENC_B_C2, 1);
 
-VL53L0X tof[2];   // [0] = canal TCA ch0, [1] = canal TCA ch1
+VL53L0X tof[5];   // [0]=avant-centre  [1]=côté-droit  [2]=avant-droit  [3]=avant-gauche  [4]=côté-gauche
 
-Adafruit_SSD1306 oled (128, 64, &Wire, -1);
-Adafruit_SSD1306 oled2(128, 64, &Wire, -1);
 Adafruit_INA219  ina219(INA219_I2C_ADDR);
 
 // ─── Globals + thread-safe TSLOG ─────────────────────────────────────────────
@@ -64,15 +63,18 @@ static volatile float gDistTestVmax   = 0.0f;   // vitesse max mesurée (cm/s)
 static SemaphoreHandle_t gSerialMutex     = nullptr;
 static SemaphoreHandle_t gI2cMutex        = nullptr;  // protège Wire (ToF + OLED + INA219)
 
-static volatile uint16_t gTofDistMm[2]   = {0, 0};
-static volatile bool     gTofTimeout[2]  = {true, true};
-static bool              gTofInitOk[2]   = {false, false};  // true si init() OK en setup()
+static constexpr uint8_t TOF_N = 5;  // total canaux TCA
+// Indices des capteurs avant : 0=avant-centre, 2=avant-droit, 3=avant-gauche
+static constexpr uint8_t kTofFront[]  = {0, 2, 3};
+static constexpr uint8_t TOF_FRONT_N  = sizeof(kTofFront);
+static volatile uint16_t gTofDistMm[TOF_N]  = {};
+static volatile bool     gTofTimeout[TOF_N] = {true, true, true, true, true};
+static bool              gTofInitOk[TOF_N]  = {};  // true si init() OK en setup()
 static volatile uint16_t gLineMid   = 0;   // capteur ligne centre  (GPIO34)
 static volatile uint16_t gLineRight = 0;   // capteur ligne droite  (GPIO35)
 static volatile uint16_t gLineLeft  = 0;   // capteur ligne gauche  (GPIO36)
 static volatile float    gVelLeftCms     = 0.0f;  // vitesse roue gauche (cm/s, signée, repère robot)
 static volatile float    gVelRightCms    = 0.0f;  // vitesse roue droite (cm/s, signée)
-static volatile uint8_t  gDisplayMode    = 0;     // 0=données, 1=visage, 2=wattmètre
 
 // ─── INA219 globals ───────────────────────────────────────────────────────────
 static volatile bool  gInaOk        = false;
@@ -101,7 +103,7 @@ static inline int16_t hmiSpeed() {
 }
 
 // ── Mode debug : commenter la ligne suivante pour désactiver tous les logs runtime ──
-// #define TSLOG_ENABLED
+#define TSLOG_ENABLED
 
 #ifdef TSLOG_ENABLED
 #define TSLOG(fmt, ...) \
@@ -153,6 +155,7 @@ static void tcaSelect(uint8_t channel) {
     Wire.beginTransmission(TCA9548A_ADDR);
     Wire.write(1 << channel);
     Wire.endTransmission();
+    delayMicroseconds(300);  // stabilisation bus après changement de canal
 }
 
 // ─── ControleurLedRgb ────────────────────────────────────────────────────────
@@ -237,14 +240,25 @@ static void onXboxInput(const XboxState& s) {
     }
     prevB = s.btnB;
 
-    // ── Y : switch interface OLED ──────────────────────────────────────────────
-    static bool prevY = false;
-    if (s.btnY && !prevY) {
-        gDisplayMode = (gDisplayMode + 1) % 3;
-        buzzerBeep(1200, 40);
-        const char* modeStr[] = {"DONNEES", "VISAGE", "WATTMETRE"};
-        TSLOG("[OLED] Mode: %s", modeStr[gDisplayMode]);
+    // ── X : toggle SUIVI LIGNE ───────────────────────────────────────────────
+    static bool prevX = false;
+    if (s.btnX && !prevX) {
+        if (gRobotMode == ROBOT_MODE_LINE) {
+            gRobotMode = ROBOT_MODE_MANUAL;
+            motorLeft.stop(); motorRight.stop();
+            buzzerMelody(kSoundAutoOff, sizeof(kSoundAutoOff) / sizeof(BuzzerNote));
+            TSLOG("[Mode] MANUEL");
+        } else {
+            gRobotMode = ROBOT_MODE_LINE;
+            motorLeft.stop(); motorRight.stop();
+            buzzerMelody(kSoundAutoOn, sizeof(kSoundAutoOn) / sizeof(BuzzerNote));
+            TSLOG("[Mode] SUIVI LIGNE");
+        }
     }
+    prevX = s.btnX;
+
+    // ── Y : (non utilisé) ────────────────────────────────────────────────────
+    static bool prevY = false;
     prevY = s.btnY;
 
     // ── A : cycle vitesse (actif aussi en AUTO) ────────────────────────────────
@@ -258,7 +272,7 @@ static void onXboxInput(const XboxState& s) {
     prevA = s.btnA;
 
     // ── En mode AUTO : Xbox ne contrôle pas les moteurs ───────────────────────
-    if (gRobotMode == ROBOT_MODE_AUTO) return;
+    if (gRobotMode == ROBOT_MODE_AUTO || gRobotMode == ROBOT_MODE_LINE) return;
 
     // ── Calcul vitesse roue gauche / droite ───────────────────────────────────
     // trigLT / trigRT : 10 bits → 0..1023  (maxTrig = 0x3FF)
@@ -542,7 +556,7 @@ static void tofReinit() {
     Wire.endTransmission();
     vTaskDelay(pdMS_TO_TICKS(20));
 
-    for (uint8_t i = 0; i < 2; i++) {
+    for (uint8_t i = 0; i < TOF_N; i++) {
         tcaSelect(i);
         vTaskDelay(pdMS_TO_TICKS(30));  // laisser le capteur booter
         bool ok = false;
@@ -566,43 +580,37 @@ static void tofReinit() {
 
 static void ToFTask(void*) {
     vTaskDelay(pdMS_TO_TICKS(500));
-    static constexpr uint8_t TOF_REINIT_THRESH = 5;  // 5 × 25ms = 125ms de timeout → reinit
+    static constexpr uint8_t TOF_REINIT_THRESH = 5;
     uint8_t consecutiveTimeouts = 0;
 
     for (;;) {
-        uint16_t d0 = 0, d1 = 0;
-        bool     t0 = true, t1 = true;
+        uint16_t d[TOF_N] = {};
+        bool     t[TOF_N];
+        for (uint8_t i = 0; i < TOF_N; i++) t[i] = true;
 
-        if (xSemaphoreTake(gI2cMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            // Canal 0
-            if (gTofInitOk[0]) {
-                tcaSelect(0);
-                d0 = tof[0].readRangeContinuousMillimeters();
-                t0 = tof[0].timeoutOccurred();
+        if (xSemaphoreTake(gI2cMutex, pdMS_TO_TICKS(150)) == pdTRUE) {
+            for (uint8_t i = 0; i < TOF_N; i++) {
+                if (gTofInitOk[i]) {
+                    tcaSelect(i);
+                    d[i] = tof[i].readRangeContinuousMillimeters();
+                    t[i] = tof[i].timeoutOccurred();
+                }
             }
-            if (gTofInitOk[1]) {
-                tcaSelect(1);
-                d1 = tof[1].readRangeContinuousMillimeters();
-                t1 = tof[1].timeoutOccurred();
-            }
-
             xSemaphoreGive(gI2cMutex);
         }
 
-        gTofDistMm[0]  = t0 ? 0 : d0;
-        gTofTimeout[0] = t0;
-        gTofDistMm[1]  = t1 ? 0 : d1;
-        gTofTimeout[1] = t1;
+        for (uint8_t i = 0; i < TOF_N; i++) {
+            gTofDistMm[i]  = t[i] ? 0 : d[i];
+            gTofTimeout[i] = t[i];
+        }
 
-        // 8191mm = valeur d'erreur VL53L0X (VCSEL timeout interne sans flag timeout)
-        // On la traite comme un timeout pour le compteur de récupération
-        const bool err0 = t0 || (d0 >= 8000);
-        const bool err1 = t1 || (d1 >= 8000);
-
-        // Récupération sur timeout persistant (bruit I2C des moteurs)
-        if (err0 && err1) {
-            consecutiveTimeouts++;
-            if (consecutiveTimeouts >= TOF_REINIT_THRESH) {
+        // Reinit si tous les capteurs initialisés sont en erreur simultanément
+        uint8_t errCount = 0, initCount = 0;
+        for (uint8_t i = 0; i < TOF_N; i++) {
+            if (gTofInitOk[i]) { initCount++; if (t[i] || d[i] >= 8000) errCount++; }
+        }
+        if (initCount > 0 && errCount == initCount) {
+            if (++consecutiveTimeouts >= TOF_REINIT_THRESH) {
                 consecutiveTimeouts = 0;
                 if (xSemaphoreTake(gI2cMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
                     tofReinit();
@@ -613,11 +621,8 @@ static void ToFTask(void*) {
             consecutiveTimeouts = 0;
         }
 
-        TSLOG("[Sensor] ToF#1=%4umm %s  ToF#2=%4umm %s",
-              gTofDistMm[0], t0 ? "TIMEOUT" : "OK     ",
-              gTofDistMm[1], t1 ? "TIMEOUT" : "OK     ");
 
-        vTaskDelay(pdMS_TO_TICKS(25));   // 40 Hz – mesure prête toutes les 20ms, on lit à 25ms
+        vTaskDelay(pdMS_TO_TICKS(25));
     }
 }
 
@@ -625,264 +630,17 @@ static void ToFTask(void*) {
 
 static void SensorTask(void*) {
     vTaskDelay(pdMS_TO_TICKS(333));
+    uint8_t logDiv = 0;
     for (;;) {
         gLineMid   = (uint16_t)analogRead(PIN_LINE_MID);
         gLineRight = (uint16_t)analogRead(PIN_LINE_RIGHT);
         gLineLeft  = (uint16_t)analogRead(PIN_LINE_LEFT);
+
+
         vTaskDelay(pdMS_TO_TICKS(1000 / SENSOR_TASK_FREQ));  // 10ms = 100Hz
     }
 }
 
-// ─── OLED – mode 0 : données ─────────────────────────────────────────────────
-
-static void oledDrawData(const XboxState& xs, float vL, float vR) {
-    const bool bleOk  = xs.connected;
-    const bool wifiOk = (WiFi.status() == WL_CONNECTED);
-
-    oled.setTextSize(1);
-    oled.setTextColor(SSD1306_WHITE);
-
-    oled.setCursor(0, 0);
-    oled.print(bleOk  ? "BLE:OK " : "BLE:-- ");
-    oled.print(wifiOk ? "WiFi:OK" : "WiFi:--");
-    oled.print(gRobotMode == ROBOT_MODE_AUTO ? " [AUTO]" : " [MAN] ");
-
-    oled.setCursor(0, 9);
-    if (wifiOk) {
-        oled.print(WiFi.localIP().toString());
-    } else if (bleOk) {
-        oled.printf("Bat:%3u%%  G:%d/6(%d%%)", xs.battery, (int)gGear + 1, (int)gSpeedPct);
-    } else {
-        oled.print("Scan BLE...");
-    }
-
-    oled.drawFastHLine(0, 18, 128, SSD1306_WHITE);
-
-    oled.setCursor(0, 21);
-    oled.printf("L:%+6.1f R:%+6.1f cm/s", vL, vR);
-
-    const char* dir;
-    if      (fabsf(vL) < 2.0f && fabsf(vR) < 2.0f) dir = "ARRET  ";
-    else if (vL >  2.0f && vR >  2.0f)              dir = "AVANT  ";
-    else if (vL < -2.0f && vR < -2.0f)              dir = "ARRIERE";
-    else if (vL >  vR + 5.0f)                       dir = "DROITE ";
-    else if (vR >  vL + 5.0f)                       dir = "GAUCHE ";
-    else                                             dir = "...    ";
-
-    oled.setCursor(0, 30);
-    oled.printf("Dir:%-7s G:%d %d%%", dir, (int)gGear + 1, (int)gSpeedPct);
-
-    oled.drawFastHLine(0, 40, 128, SSD1306_WHITE);
-
-    oled.setCursor(0, 43);
-    if (gTofTimeout[0])
-        oled.print("T1:----  ");
-    else
-        oled.printf("T1:%4umm ", gTofDistMm[0]);
-    if (gTofTimeout[1])
-        oled.print("T2:----");
-    else
-        oled.printf("T2:%4umm", gTofDistMm[1]);
-
-    oled.setCursor(0, 53);
-    oled.printf("G:%4u M:%4u D:%4u", (unsigned)gLineLeft, (unsigned)gLineMid, (unsigned)gLineRight);
-}
-
-// ─── OLED – mode 1 : visage ───────────────────────────────────────────────────
-// Tête centrée (64,27) r=24. Texte d'état y=55. Y=btn Xbox pour switcher.
-
-enum class RobotFace : uint8_t { SEARCH, IDLE, ATTACK, RETREAT, SPIN };
-
-static void faceHead() {
-    oled.drawCircle(64, 27, 24, SSD1306_WHITE);
-}
-
-static void drawFaceSearch() {
-    faceHead();
-    // œil gauche ouvert, œil droit = clin d'œil horizontal (il cherche)
-    oled.drawCircle(51, 23, 5, SSD1306_WHITE);
-    oled.fillCircle(52, 24, 2, SSD1306_WHITE);
-    oled.drawLine(70, 22, 81, 22, SSD1306_WHITE);   // wink
-    // sourcils haussés en V inversé
-    oled.drawLine(45, 13, 52, 17, SSD1306_WHITE);
-    oled.drawLine(52, 17, 59, 15, SSD1306_WHITE);
-    oled.drawLine(69, 15, 76, 17, SSD1306_WHITE);
-    oled.drawLine(76, 17, 83, 13, SSD1306_WHITE);
-    // bouche ondulée (confus)
-    oled.drawLine(52, 37, 56, 33, SSD1306_WHITE);
-    oled.drawLine(56, 33, 60, 37, SSD1306_WHITE);
-    oled.drawLine(60, 37, 64, 33, SSD1306_WHITE);
-    oled.drawLine(64, 33, 68, 37, SSD1306_WHITE);
-    oled.drawLine(68, 37, 72, 33, SSD1306_WHITE);
-    // gros point d'interrogation
-    oled.setTextSize(2);
-    oled.setCursor(90, 16);
-    oled.print("?");
-    oled.setTextSize(1);
-    oled.setCursor(14, 55);
-    oled.print("SCAN MANETTE...");
-}
-
-static void drawFaceIdle() {
-    faceHead();
-    // yeux normaux avec pupilles
-    oled.drawCircle(51, 23, 4, SSD1306_WHITE);
-    oled.fillCircle(52, 24, 2, SSD1306_WHITE);
-    oled.drawCircle(77, 23, 4, SSD1306_WHITE);
-    oled.fillCircle(78, 24, 2, SSD1306_WHITE);
-    // sourcils légèrement arqués
-    oled.drawLine(46, 16, 56, 14, SSD1306_WHITE);
-    oled.drawLine(72, 14, 82, 16, SSD1306_WHITE);
-    // sourire
-    oled.drawLine(53, 36, 57, 39, SSD1306_WHITE);
-    oled.drawLine(57, 39, 64, 41, SSD1306_WHITE);
-    oled.drawLine(64, 41, 71, 39, SSD1306_WHITE);
-    oled.drawLine(71, 39, 75, 36, SSD1306_WHITE);
-    oled.setCursor(20, 55);
-    oled.print("EN ATTENTE...");
-}
-
-static void drawFaceAttack() {
-    faceHead();
-    // sourcils en V (colère) – épais (deux lignes)
-    oled.drawLine(43, 11, 57, 19, SSD1306_WHITE);
-    oled.drawLine(44, 12, 58, 20, SSD1306_WHITE);
-    oled.drawLine(85, 11, 71, 19, SSD1306_WHITE);
-    oled.drawLine(84, 12, 70, 20, SSD1306_WHITE);
-    // yeux plissés (rectangles fins)
-    oled.fillRect(46, 23, 12, 3, SSD1306_WHITE);
-    oled.fillRect(70, 23, 12, 3, SSD1306_WHITE);
-    // dents : rectangle blanc + séparateurs noirs
-    oled.fillRect(51, 37, 26, 7, SSD1306_WHITE);
-    oled.drawLine(57, 37, 57, 44, SSD1306_BLACK);
-    oled.drawLine(64, 37, 64, 44, SSD1306_BLACK);
-    oled.drawLine(71, 37, 71, 44, SSD1306_BLACK);
-    // lignes d'action sur les côtés
-    oled.drawLine(29, 20, 38, 23, SSD1306_WHITE);
-    oled.drawLine(27, 27, 37, 27, SSD1306_WHITE);
-    oled.drawLine(99, 20, 90, 23, SSD1306_WHITE);
-    oled.drawLine(101, 27, 91, 27, SSD1306_WHITE);
-    oled.setCursor(27, 55);
-    oled.print("ATTAQUE !!!");
-}
-
-static void drawFaceRetreat() {
-    faceHead();
-    // sourcils haussés et ondulés (peur)
-    oled.drawLine(44, 11, 51, 15, SSD1306_WHITE);
-    oled.drawLine(51, 15, 58, 12, SSD1306_WHITE);
-    oled.drawLine(70, 12, 77, 15, SSD1306_WHITE);
-    oled.drawLine(77, 15, 84, 11, SSD1306_WHITE);
-    // grands yeux ronds (terrifiés)
-    oled.drawCircle(51, 24, 7, SSD1306_WHITE);
-    oled.fillCircle(51, 25, 3, SSD1306_WHITE);
-    oled.drawCircle(77, 24, 7, SSD1306_WHITE);
-    oled.fillCircle(77, 25, 3, SSD1306_WHITE);
-    // bouche ouverte en O
-    oled.drawCircle(64, 40, 5, SSD1306_WHITE);
-    // gouttes de sueur
-    oled.fillCircle(34, 16, 2, SSD1306_WHITE);
-    oled.fillTriangle(32, 16, 36, 16, 34, 23, SSD1306_WHITE);
-    oled.fillCircle(38, 8, 1, SSD1306_WHITE);
-    oled.fillTriangle(37, 8, 39, 8, 38, 13, SSD1306_WHITE);
-    oled.setCursor(32, 55);
-    oled.print("FUITE !!!");
-}
-
-static void drawFaceSpin() {
-    faceHead();
-    // yeux X (étourdis)
-    oled.drawLine(45, 18, 57, 28, SSD1306_WHITE);
-    oled.drawLine(57, 18, 45, 28, SSD1306_WHITE);
-    oled.drawLine(71, 18, 83, 28, SSD1306_WHITE);
-    oled.drawLine(83, 18, 71, 28, SSD1306_WHITE);
-    // étoiles autour de la tête
-    for (int i = 0; i < 3; i++) {
-        const int8_t sx[] = {38, 64, 90};
-        const int8_t sy[] = { 3,  1,  3};
-        oled.drawLine(sx[i]-2, sy[i],   sx[i]+2, sy[i],   SSD1306_WHITE);
-        oled.drawLine(sx[i],   sy[i]-2, sx[i],   sy[i]+2, SSD1306_WHITE);
-        oled.drawLine(sx[i]-1, sy[i]-1, sx[i]+1, sy[i]+1, SSD1306_WHITE);
-        oled.drawLine(sx[i]+1, sy[i]-1, sx[i]-1, sy[i]+1, SSD1306_WHITE);
-    }
-    // bouche ondulée
-    oled.drawLine(51, 37, 55, 33, SSD1306_WHITE);
-    oled.drawLine(55, 33, 59, 37, SSD1306_WHITE);
-    oled.drawLine(59, 37, 63, 33, SSD1306_WHITE);
-    oled.drawLine(63, 33, 67, 37, SSD1306_WHITE);
-    oled.drawLine(67, 37, 71, 33, SSD1306_WHITE);
-    oled.drawLine(71, 33, 75, 37, SSD1306_WHITE);
-    oled.setCursor(24, 55);
-    oled.print("TOURNOIE ~_~");
-}
-
-static RobotFace determineFace(bool bleOk, float vL, float vR) {
-    if (!bleOk)                               return RobotFace::SEARCH;
-    const float T = 5.0f;
-    if (vL >  T && vR < -T)                  return RobotFace::SPIN;    // spin droite
-    if (vL < -T && vR >  T)                  return RobotFace::SPIN;    // spin gauche
-    if (vL >  T && vR >  T)                  return RobotFace::ATTACK;
-    if (vL < -T && vR < -T)                  return RobotFace::RETREAT;
-    return RobotFace::IDLE;
-}
-
-// ─── OLED – mode 2 : wattmètre ───────────────────────────────────────────────
-// DFRobot SEN0291 INA219 – shunt 10 mΩ
-// I(mA) = Vshunt(mV) × 100    (car R=0.01 Ω → I=V/R)
-// P(mW) = Vbus(V)   × I(mA)
-
-static void oledDrawWatt() {
-    oled.setTextSize(1);
-    oled.setTextColor(SSD1306_WHITE);
-
-    if (!gInaOk) {
-        oled.setCursor(16, 24);
-        oled.print("INA219 non detecte");
-        oled.setCursor(20, 36);
-        oled.print("Verif cablage I2C");
-        return;
-    }
-
-    const float busV     = gInaBusV;
-    const float shuntMv  = gInaShuntMv;
-    const float currentMa = gInaCurrentMa;
-    const float powerW   = gInaPowerMw / 1000.0f;
-    const float energyWh = gAccEnergyWh;
-    const float chargeMah = gAccChargeMah;
-
-    // Ligne 0 – titre
-    oled.setCursor(28, 0);
-    oled.print("--- WATTMETRE ---");
-
-    // Ligne 1 – tension batterie
-    oled.setCursor(0, 9);
-    oled.printf("Vbat : %5.2f V", busV);
-
-    // Ligne 2 – courant
-    oled.setCursor(0, 18);
-    if (fabsf(currentMa) >= 1000.0f)
-        oled.printf("I    : %5.2f A", currentMa / 1000.0f);
-    else
-        oled.printf("I    : %5.1f mA", currentMa);
-
-    // Ligne 3 – puissance
-    oled.setCursor(0, 27);
-    oled.printf("P    : %5.2f W", powerW);
-
-    oled.drawFastHLine(0, 37, 128, SSD1306_WHITE);
-
-    // Ligne 4 – énergie cumulée
-    oled.setCursor(0, 40);
-    oled.printf("Eh   : %6.3f Wh", energyWh);
-
-    // Ligne 5 – charge cumulée
-    oled.setCursor(0, 49);
-    oled.printf("Qh   : %6.1f mAh", chargeMah);
-
-    // Ligne 6 – tension shunt (debug)
-    oled.setCursor(0, 58);
-    oled.printf("Vsh  : %+6.2f mV", shuntMv);
-}
 
 // ─── Pattern Strategy – Labo 6 ───────────────────────────────────────────────
 // Wrapper moteurs (miroir gauche compensé)
@@ -909,19 +667,37 @@ public:
 //   100-250mm → pression       55%
 //    < 100 mm → sprint final   70%
 class StrategieCharge : public IStrategieRobot {
-    bool _done = false;
+    bool     _done        = false;
+    bool     _pushing     = false;
+    uint32_t _pushUntilMs = 0;
 public:
-    void demarrer() override { _done = false; Bot::avancer(MOTOR_PWM_MAX * 30 / 100); }
+    void demarrer() override {
+        _done = false; _pushing = false; _pushUntilMs = 0;
+        Bot::avancer(MOTOR_PWM_MAX * 30 / 100);
+    }
     void mettreAJour() override {
-        const uint16_t dist = gTofDistMm[0];
-        if (gTofTimeout[0] || dist >= TOF_LOST_MM) {
-            Bot::avancer(MOTOR_PWM_MAX * 30 / 100);   // adversaire hors portée – avance doucement
-        } else if (dist > 250) {
-            Bot::avancer(MOTOR_PWM_MAX * 30 / 100);   // loin : approche lente
-        } else if (dist > 100) {
-            Bot::avancer(MOTOR_PWM_MAX * 42 / 100);   // proche : pression
+        // Min des 3 capteurs avant (tof[0]=centre, tof[2]=avant-droit, tof[3]=avant-gauche)
+        uint16_t dist = 9999;
+        for (uint8_t i = 0; i < TOF_FRONT_N; i++) {
+            const uint8_t ch = kTofFront[i];
+            if (!gTofTimeout[ch] && gTofDistMm[ch] < dist) dist = gTofDistMm[ch];
+        }
+        const uint32_t now = millis();
+
+        // Phase poussée : verrouille vitesse max 1.5s (ToF peu fiable au contact)
+        if (dist < 150) {
+            _pushing     = true;
+            _pushUntilMs = now + 1500;
+        }
+        if (_pushing && now < _pushUntilMs) {
+            Bot::avancer(MOTOR_PWM_MAX * 70 / 100);   // poussée soutenue
         } else {
-            Bot::avancer(MOTOR_PWM_MAX * 60 / 100);   // très proche : sprint final
+            _pushing = false;
+            // Phase approche graduée
+            if      (dist >= TOF_LOST_MM) Bot::avancer(MOTOR_PWM_MAX * 30 / 100);  // recherche
+            else if (dist > 300)          Bot::avancer(MOTOR_PWM_MAX * 35 / 100);  // loin
+            else if (dist > 150)          Bot::avancer(MOTOR_PWM_MAX * 50 / 100);  // proche
+            else                          Bot::avancer(MOTOR_PWM_MAX * 65 / 100);  // sprint
         }
     }
     void arreter()     override { Bot::arreter(); _done = true; }
@@ -933,7 +709,7 @@ public:
 class StrategieRotation : public IStrategieRobot {
     bool _done = false;
 public:
-    void demarrer() override { _done = false; Bot::pivoterCW(MOTOR_PWM_MAX * 35 / 100); }  // 35% – recherche
+    void demarrer() override { _done = false; Bot::pivoterCW(MOTOR_PWM_MAX * 25 / 100); }  // 25% – recherche
     void mettreAJour() override {}   // FSM interrompt si adversaire détecté
     void arreter()     override { Bot::arreter(); _done = true; }
     bool estTerminee() override { return _done; }
@@ -1023,16 +799,19 @@ public:
     void mettreAJour() {
         if (_etat == COMBAT_ARRET || !_strat) return;
 
-        // Capteurs ligne – blanc = basse valeur
         const bool bordL = gLineLeft  < LINE_THRESHOLD;
         const bool bordM = gLineMid   < LINE_THRESHOLD;
         const bool bordR = gLineRight < LINE_THRESHOLD;
         const bool bord  = bordL || bordM || bordR;
 
-        // ToF[0] = seul capteur fonctionnel (avant)
-        const bool tofOk      = !gTofTimeout[0];
-        const bool adversaire = tofOk && gTofDistMm[0] < TOF_ATTACK_MM;
-        const bool perdu      = !tofOk || gTofDistMm[0] > TOF_LOST_MM;
+        // Capteurs avant (ch 0, 2, 3) : adversaire si l'un d'eux voit < TOF_ATTACK_MM
+        uint16_t minFront = 9999;
+        for (uint8_t i = 0; i < TOF_FRONT_N; i++) {
+            const uint8_t ch = kTofFront[i];
+            if (!gTofTimeout[ch] && gTofDistMm[ch] < minFront) minFront = gTofDistMm[ch];
+        }
+        const bool adversaire = minFront < TOF_ATTACK_MM;
+        const bool perdu      = minFront >= TOF_LOST_MM;
 
         // Priorité 1 – bord détecté → DEFENSE (prime sur tout)
         if (bord && _etat != COMBAT_DEFENSE) {
@@ -1045,7 +824,7 @@ public:
         else if (adversaire && _etat == COMBAT_RECHERCHE) {
             _etat = COMBAT_ATTAQUE;
             changerStrategie(new StrategieCharge());
-            TSLOG("[Combat] ATTAQUE  tof=%umm", gTofDistMm[0]);
+            TSLOG("[Combat] ATTAQUE  min=%umm  [C:%u D:%u G:%u]", minFront, gTofDistMm[0], gTofDistMm[2], gTofDistMm[3]);
         }
         // Priorité 3 – adversaire perdu en attaque → RECHERCHE
         else if (perdu && _etat == COMBAT_ATTAQUE) {
@@ -1067,6 +846,28 @@ public:
     const char* nomStrat() const { return _strat ? _strat->nom() : "aucune"; }
 };
 
+// ─── Suivi ligne arène – avance lentement, recule si bord détecté ────────────
+static void suivreLigne() {
+    const bool bL = gLineLeft  < LINE_THRESHOLD;
+    const bool bM = gLineMid   < LINE_THRESHOLD;
+    const bool bR = gLineRight < LINE_THRESHOLD;
+
+    if (bL || bM || bR) {
+        // Recul avec léger pivot vers l'intérieur de l'arène
+        if (bL || (bM && !bR)) {
+            // Bord gauche → recule en pivotant vers la droite
+            motorLeft.setSpeed(-(int16_t)(MOTOR_PWM_MAX * 15 / 100));
+            motorRight.setSpeed(-(int16_t)(MOTOR_PWM_MAX * 42 / 100));
+        } else {
+            // Bord droit → recule en pivotant vers la gauche
+            motorLeft.setSpeed(-(int16_t)(MOTOR_PWM_MAX * 42 / 100));
+            motorRight.setSpeed(-(int16_t)(MOTOR_PWM_MAX * 15 / 100));
+        }
+    } else {
+        Bot::avancer(MOTOR_PWM_MAX * 23 / 100);
+    }
+}
+
 // ─── Auto task ────────────────────────────────────────────────────────────────
 
 static void AutoTask(void*) {
@@ -1074,8 +875,17 @@ static void AutoTask(void*) {
     bool wasActive = false;
 
     for (;;) {
+        // Mode suivi ligne
+        if (gRobotMode == ROBOT_MODE_LINE) {
+            if (wasActive) { combat.arreterCombat(); wasActive = false; }
+            suivreLigne();
+            vTaskDelay(pdMS_TO_TICKS(1000 / AUTO_TASK_FREQ));
+            continue;
+        }
+
         if (gRobotMode != ROBOT_MODE_AUTO) {
             if (wasActive) { combat.arreterCombat(); wasActive = false; }
+            motorLeft.stop(); motorRight.stop();
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
@@ -1116,6 +926,8 @@ static void WattTask(void*) {
                 gAccEnergyWh  += (powerMw / 1000.0f) * dtH;
                 gAccChargeMah += currentMa * dtH;
             }
+            TSLOG("[Watt] Vbat=%.2fV  I=%.0fmA  P=%.2fW  Eh=%.4fWh  Qh=%.1fmAh",
+                  busV, currentMa, powerMw / 1000.0f, gAccEnergyWh, gAccChargeMah);
         } else if (gInaOk) {
             // mutex timeout ou inaFailCount >= 5 : bus I2C occupé ou bloqué
             inaFailCount++;
@@ -1130,132 +942,6 @@ static void WattTask(void*) {
     }
 }
 
-// ─── OLED task – 5 Hz ────────────────────────────────────────────────────────
-
-static void OledTask(void*) {
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    RobotFace prevFace     = RobotFace::IDLE;
-    RobotFace candidateFace = RobotFace::IDLE;
-    uint8_t   stableFrames  = 0;
-    uint32_t  lastSoundMs   = 0;
-
-    uint32_t distDoneMs = 0;   // timestamp fin du test (pour affichage 10s)
-
-    for (;;) {
-        oled.clearDisplay();
-
-        // ── Test distance en cours ────────────────────────────────────────
-        if (gDistTestActive) {
-            oled.setTextSize(1);
-            oled.setTextColor(SSD1306_WHITE);
-            oled.setCursor(16, 10);  oled.print("TEST DISTANCE");
-            oled.setCursor(28, 24);  oled.print("EN COURS...");
-            oled.setCursor(20, 38);  oled.print("5 secondes @ 100%");
-            if (xSemaphoreTake(gI2cMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                oled.display();
-                memcpy(oled2.getBuffer(), oled.getBuffer(), 128 * 64 / 8);
-                oled2.display();
-                xSemaphoreGive(gI2cMutex);
-            }
-            vTaskDelay(pdMS_TO_TICKS(200));
-            continue;
-        }
-
-        // ── Résultat test distance (affiché 10s) ─────────────────────────
-        if (gDistTestDone) {
-            if (distDoneMs == 0) distDoneMs = millis();
-            if (millis() - distDoneMs < 10000) {
-                oled.setTextSize(1);
-                oled.setTextColor(SSD1306_WHITE);
-                oled.setCursor(22, 0);   oled.print("RESULTAT TEST 5s");
-                oled.drawFastHLine(0, 10, 128, SSD1306_WHITE);
-                oled.setCursor(0, 14);   oled.printf("Dist L : %6.1f cm", gDistTestL_cm);
-                oled.setCursor(0, 24);   oled.printf("Dist R : %6.1f cm", gDistTestR_cm);
-                oled.setCursor(0, 34);   oled.printf("Moy    : %6.1f cm", (gDistTestL_cm + gDistTestR_cm) * 0.5f);
-                oled.drawFastHLine(0, 45, 128, SSD1306_WHITE);
-                oled.setCursor(0, 48);   oled.printf("Vmax   : %6.1f cm/s", gDistTestVmax);
-                oled.setCursor(0, 57);   oled.printf("Vtheo  :  ~101.0 cm/s");
-                if (xSemaphoreTake(gI2cMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    oled.display();
-                    memcpy(oled2.getBuffer(), oled.getBuffer(), 128 * 64 / 8);
-                    oled2.display();
-                    xSemaphoreGive(gI2cMutex);
-                }
-                vTaskDelay(pdMS_TO_TICKS(200));
-                continue;
-            }
-            gDistTestDone = false;
-            distDoneMs    = 0;
-        }
-
-        XboxState xs;
-        xbox.getState(xs);
-        const float vL = gVelLeftCms;
-        const float vR = gVelRightCms;
-
-        if (gDisplayMode == 0) {
-            // ── Mode données ──────────────────────────────────────────────
-            oledDrawData(xs, vL, vR);
-
-        } else if (gDisplayMode == 1) {
-            // ── Mode visage ───────────────────────────────────────────────
-            const RobotFace face = determineFace(xs.connected, vL, vR);
-
-            // Debounce : 2 frames consécutives identiques avant changement d'état
-            if (face == candidateFace) {
-                if (stableFrames < 2) stableFrames++;
-            } else {
-                candidateFace = face;
-                stableFrames  = 1;
-            }
-            const RobotFace stableFace = (stableFrames >= 2) ? candidateFace : prevFace;
-
-            // Son au changement d'état stable + cooldown 1.5s (anti-bombe nucléaire)
-            if (stableFace != prevFace && (millis() - lastSoundMs) >= 1500) {
-                switch (stableFace) {
-                    case RobotFace::ATTACK:
-                        buzzerMelody(kSoundAttack, sizeof(kSoundAttack)/sizeof(kSoundAttack[0]));
-                        break;
-                    case RobotFace::RETREAT:
-                        buzzerMelody(kSoundRetreat, sizeof(kSoundRetreat)/sizeof(kSoundRetreat[0]));
-                        break;
-                    case RobotFace::SPIN:
-                        buzzerMelody(kSoundSpin, sizeof(kSoundSpin)/sizeof(kSoundSpin[0]));
-                        break;
-                    default: break;
-                }
-                lastSoundMs = millis();
-                prevFace = stableFace;
-            }
-
-            switch (stableFace) {
-                case RobotFace::SEARCH:  drawFaceSearch();  break;
-                case RobotFace::IDLE:    drawFaceIdle();    break;
-                case RobotFace::ATTACK:  drawFaceAttack();  break;
-                case RobotFace::RETREAT: drawFaceRetreat(); break;
-                case RobotFace::SPIN:    drawFaceSpin();    break;
-            }
-
-            // Indicateur de mode + gear en haut à droite (petit)
-            oled.setCursor(96, 0);
-            oled.printf("G%d %d%%", (int)gGear + 1, (int)gSpeedPct);
-
-        } else {
-            // ── Mode wattmètre (mode 2) ───────────────────────────────────
-            oledDrawWatt();
-        }
-
-        if (xSemaphoreTake(gI2cMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            oled.display();
-            // Miroir sur le second écran : copie le buffer pixel-par-pixel
-            memcpy(oled2.getBuffer(), oled.getBuffer(), 128 * 64 / 8);
-            oled2.display();
-            xSemaphoreGive(gI2cMutex);
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000 / OLED_TASK_FREQ));
-    }
-}
 
 // ─── Buzzer task ─────────────────────────────────────────────────────────────
 
@@ -1295,8 +981,25 @@ static void StatusTask(void*) {
 // ─── Setup ───────────────────────────────────────────────────────────────────
 
 void setup() {
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);  // désactive brownout detector
     Serial.begin(115200);
     delay(300);
+
+    // ── Raison du dernier reset ───────────────────────────────────────────────
+    const esp_reset_reason_t rr = esp_reset_reason();
+    const char* rrStr = "INCONNU";
+    switch (rr) {
+        case ESP_RST_POWERON:   rrStr = "POWER_ON";    break;
+        case ESP_RST_EXT:       rrStr = "RESET_EXT";   break;
+        case ESP_RST_SW:        rrStr = "SW_RESET";    break;
+        case ESP_RST_PANIC:     rrStr = "PANIC";       break;
+        case ESP_RST_INT_WDT:   rrStr = "INT_WDT";     break;
+        case ESP_RST_TASK_WDT:  rrStr = "TASK_WDT";    break;
+        case ESP_RST_WDT:       rrStr = "WDT";         break;
+        case ESP_RST_BROWNOUT:  rrStr = "BROWNOUT";    break;
+        default: break;
+    }
+    Serial.printf("[Reset] Raison: %s (%d)\n", rrStr, (int)rr);
     gSerialMutex = xSemaphoreCreateMutex();
     gI2cMutex    = xSemaphoreCreateMutex();
 
@@ -1318,54 +1021,25 @@ void setup() {
     Serial.printf("[Enc]   A:C1=%d,C2=%d  B:C1=%d,C2=%d  PPR=%d\n",
                   ENC_A_C1, ENC_A_C2, ENC_B_C1, ENC_B_C2, ENCODER_PPR);
 
-    // ── I2C + OLED ────────────────────────────────────────────────────────────
+    // ── I2C ───────────────────────────────────────────────────────────────────
     Wire.begin(PIN_IIC_SDA, PIN_IIC_SCL);
-    Wire.setClock(400000);  // 400 kHz fast mode
+    Wire.setClock(400000);
     Serial.printf("[I2C]   SDA=%d  SCL=%d  TCA=0x%02X\n",
                   PIN_IIC_SDA, PIN_IIC_SCL, TCA9548A_ADDR);
 
-    if (oled.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR)) {
-        oled.clearDisplay();
-        oled.setTextSize(1);
-        oled.setTextColor(SSD1306_WHITE);
-        oled.setCursor(0, 20);
-        oled.println("  Sanjo Sumo - Boot");
-        oled.display();
-        Serial.printf("[OLED]  OK  addr=0x%02X\n", OLED_I2C_ADDR);
-    } else {
-        Serial.println("[OLED]  ERREUR – verifier addr (0x3C ou 0x3D)");
-    }
-
-    if (oled2.begin(SSD1306_SWITCHCAPVCC, OLED2_I2C_ADDR)) {
-        oled2.clearDisplay();
-        oled2.display();
-        Serial.printf("[OLED2] OK  addr=0x%02X\n", OLED2_I2C_ADDR);
-    } else {
-        Serial.printf("[OLED2] non detecte addr=0x%02X (desactive)\n", OLED2_I2C_ADDR);
-    }
-
-
-    // ── INA219 wattmètre (DFRobot SEN0291, shunt 10 mΩ) ─────────────────────
-    gInaOk = ina219.begin();
-    if (gInaOk) {
-        Serial.printf("[INA219] OK  addr=0x%02X\n", INA219_I2C_ADDR);
-    } else {
-        Serial.println("[INA219] ERREUR – verifier cablage (IN+→bat+, IN-→charge, SDA/SCL)");
-    }
+    // ── INA219 DÉSACTIVÉ ─────────────────────────────────────────────────────
+    Serial.println("[INA219] desactive");
 
     // ── VL53L0X via TCA9548A (adresse mux = 0x70) ────────────────────────────
-    // Récupération bus I2C (setup uniquement – BLE pas encore démarré, Wire.end() safe)
     auto i2cBusRecover = []() {
         Wire.end();
         delay(5);
-        // 9 impulsions SCL pour libérer SDA bloqué par le capteur (I2C bus clear)
         pinMode(PIN_IIC_SCL, OUTPUT);
         pinMode(PIN_IIC_SDA, OUTPUT);
         for (int p = 0; p < 9; p++) {
             digitalWrite(PIN_IIC_SCL, HIGH); delayMicroseconds(5);
             digitalWrite(PIN_IIC_SCL, LOW);  delayMicroseconds(5);
         }
-        // Condition STOP (SDA LOW→HIGH pendant SCL HIGH)
         digitalWrite(PIN_IIC_SDA, LOW);
         digitalWrite(PIN_IIC_SCL, HIGH); delayMicroseconds(5);
         digitalWrite(PIN_IIC_SDA, HIGH); delayMicroseconds(5);
@@ -1376,10 +1050,10 @@ void setup() {
         Serial.println("[I2C]   Bus recover OK");
     };
 
-    for (uint8_t i = 0; i < 2; i++) {
+    for (uint8_t i = 0; i < TOF_N; i++) {
         tcaSelect(i);
         delay(10);
-        tof[i].setTimeout(25);   // timeout court → jamais bloquant plus de 25ms
+        tof[i].setTimeout(25);
         bool ok = false;
         for (uint8_t attempt = 0; attempt < 3 && !ok; attempt++) {
             if (tof[i].init()) {
@@ -1397,7 +1071,7 @@ void setup() {
         }
         if (!ok) {
             gTofInitOk[i] = false;
-            Serial.printf("[ToF]   #%d ERREUR (TCA canal %d)\n", i + 1, i);
+            Serial.printf("[ToF]   #%d absent (TCA canal %d)\n", i + 1, i);
         }
     }
 
@@ -1426,9 +1100,9 @@ void setup() {
     // ── WiFi DÉSACTIVÉ (test diagnostic) ─────────────────────────────────────
     Serial.println("[WiFi]  DESACTIVE (test)");
 
-    // ── Xbox BLE (après WiFi – radio 2.4GHz déjà initialisée, pas de race) ───
+    // ── Xbox BLE ─────────────────────────────────────────────────────────────
     xbox.begin(onXboxInput);
-    Serial.println("[Xbox]  BLE scan démarré");
+    Serial.println("[Xbox]  BLE scan demarre");
 
     // ── Tasks ─────────────────────────────────────────────────────────────────
     if (WiFi.status() == WL_CONNECTED) {
@@ -1436,12 +1110,10 @@ void setup() {
     }
     xTaskCreatePinnedToCore(BuzzerTask,  "BuzzerTask",  2048, nullptr, 2, nullptr, 0);
     xTaskCreatePinnedToCore(EncoderTask, "EncoderTask", 2048, nullptr, 1, nullptr, 0);
-    xTaskCreatePinnedToCore(ToFTask,     "ToFTask",     2048, nullptr, 1, nullptr, 1);  // Core 1 – même core que Wire.begin()
-    xTaskCreatePinnedToCore(SensorTask,  "SensorTask",  2048, nullptr, 2, nullptr, 0);  // ADC 100Hz, Core 0
     xTaskCreatePinnedToCore(StatusTask,  "StatusTask",  2048, nullptr, 1, nullptr, 0);
-    xTaskCreatePinnedToCore(WattTask,    "WattTask",    4096, nullptr, 1, nullptr, 1);  // Core 1 – même core que Wire.begin()
-    xTaskCreatePinnedToCore(OledTask,    "OledTask",    5120, nullptr, 1, nullptr, 1);  // Core 1 – même core que Wire.begin()
-    xTaskCreatePinnedToCore(AutoTask,    "AutoTask",    3072, nullptr, 2, nullptr, 1);  // +1024 pour ControleurCombat+strategies
+    xTaskCreatePinnedToCore(ToFTask,     "ToFTask",     3072, nullptr, 1, nullptr, 1);
+    xTaskCreatePinnedToCore(SensorTask,  "SensorTask",  2048, nullptr, 2, nullptr, 0);  // ADC 100Hz, Core 0
+    xTaskCreatePinnedToCore(AutoTask,    "AutoTask",    3072, nullptr, 2, nullptr, 1);
     Serial.println("[Tasks] Demarre");
 
     Serial.println("[Setup] Pret\n");
@@ -1515,14 +1187,32 @@ static void runDistanceTest() {
 // ─── Loop ─────────────────────────────────────────────────────────────────────
 
 void loop() {
+    // Activation automatique du mode combat 5s après le démarrage
+    static bool sAutoStartDone = false;
+    if (!sAutoStartDone && millis() > 5000) {
+        sAutoStartDone = true;
+        gRobotMode = ROBOT_MODE_AUTO;
+        buzzerMelody(kSoundAutoOn, sizeof(kSoundAutoOn) / sizeof(BuzzerNote));
+        TSLOG("[Boot] → MODE AUTO (5s)");
+    }
+
     static bool lastBtn = HIGH;
 
     const bool btn = digitalRead(PIN_BUTTON_1);
     if (btn == LOW && lastBtn == HIGH) {
-        delay(20);
+        delay(20);  // antirebond
         if (digitalRead(PIN_BUTTON_1) == LOW) {
-            TSLOG("[Btn] Test distance 5s");
-            runDistanceTest();
+            if (gRobotMode == ROBOT_MODE_MANUAL) {
+                gRobotMode = ROBOT_MODE_AUTO;
+                motorLeft.stop(); motorRight.stop();
+                buzzerMelody(kSoundAutoOn,  sizeof(kSoundAutoOn)  / sizeof(BuzzerNote));
+                TSLOG("[Btn] → MODE AUTO");
+            } else {
+                gRobotMode = ROBOT_MODE_MANUAL;
+                motorLeft.stop(); motorRight.stop();
+                buzzerMelody(kSoundAutoOff, sizeof(kSoundAutoOff) / sizeof(BuzzerNote));
+                TSLOG("[Btn] → MODE MANUEL");
+            }
         }
     }
     lastBtn = btn;

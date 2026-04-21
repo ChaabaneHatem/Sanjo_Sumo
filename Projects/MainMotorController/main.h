@@ -6,7 +6,6 @@
 #define ENCODER_TASK_FREQ        1   // Encoder RPM read + log  (1 Hz)
 #define SENSOR_TASK_FREQ       100   // ToF + line sensor read (100Hz = 10ms)
 #define STATUS_TASK_FREQ         1   // Xbox connectivity status log
-#define OLED_TASK_FREQ           5   // Rafraîchissement écran OLED (Hz)
 #define WATT_TASK_FREQ           2   // Lecture INA219 wattmètre (Hz)
 
 // ─── Buzzer ───────────────────────────────────────────────────────────────────
@@ -23,7 +22,8 @@
 
 // ─── Mode robot ──────────────────────────────────────────────────────────────
 #define ROBOT_MODE_MANUAL  0   // contrôle Xbox
-#define ROBOT_MODE_AUTO    1   // évitement bordure automatique
+#define ROBOT_MODE_AUTO    1   // combat automatique
+#define ROBOT_MODE_LINE    2   // suivi bordure arène (lent)
 
 // ─── Capteurs ligne – seuil détection bordure blanche ────────────────────────
 // ADC 12-bit : arena noire ≈ >2500  |  bordure blanche ≈ <300

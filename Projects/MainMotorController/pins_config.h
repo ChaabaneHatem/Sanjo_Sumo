@@ -18,8 +18,6 @@
 #define PIN_IIC_SCL      22   // SCL
 #define PIN_IIC_SDA      21   // SDA
 #define TCA9548A_ADDR  0x70   // A2=GND, A1=GND, A0=GND (adresse de base)
-#define OLED_I2C_ADDR   0x3C   // SSD1306 128×64 principal  (SA0=GND → 0x3C)
-#define OLED2_I2C_ADDR  0x3D   // SSD1315 128×64 secondaire (SA0=VCC → 0x3D)
 #define INA219_I2C_ADDR 0x45  // DFRobot SEN0291 – A1=VCC, A0=VCC → 0x45
 
 // ─── Capteurs ligne analogiques (ADC1 uniquement – WiFi safe) ────────────────
