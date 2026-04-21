@@ -66,6 +66,7 @@ static SemaphoreHandle_t gI2cMutex        = nullptr;  // protège Wire (ToF + OL
 
 static volatile uint16_t gTofDistMm[2]   = {0, 0};
 static volatile bool     gTofTimeout[2]  = {true, true};
+static bool              gTofInitOk[2]   = {false, false};  // true si init() OK en setup()
 static volatile uint16_t gLineMid   = 0;   // capteur ligne centre  (GPIO34)
 static volatile uint16_t gLineRight = 0;   // capteur ligne droite  (GPIO35)
 static volatile uint16_t gLineLeft  = 0;   // capteur ligne gauche  (GPIO36)
@@ -99,6 +100,10 @@ static inline int16_t hmiSpeed() {
     return (int16_t)((MOTOR_PWM_MAX * gSpeedPct) / 100);
 }
 
+// ── Mode debug : commenter la ligne suivante pour désactiver tous les logs runtime ──
+// #define TSLOG_ENABLED
+
+#ifdef TSLOG_ENABLED
 #define TSLOG(fmt, ...) \
     do { \
         if (gSerialMutex && xSemaphoreTake(gSerialMutex, pdMS_TO_TICKS(50)) == pdTRUE) { \
@@ -106,6 +111,9 @@ static inline int16_t hmiSpeed() {
             xSemaphoreGive(gSerialMutex); \
         } \
     } while(0)
+#else
+#define TSLOG(fmt, ...) do {} while(0)
+#endif
 
 // ─── Buzzer – queue-based async ──────────────────────────────────────────────
 
@@ -525,18 +533,35 @@ static void EncoderTask(void*) {
 // Réinitialise les deux capteurs VL53L0X sous le mutex I2C.
 // Appelé après TOF_REINIT_THRESH cycles consécutifs de timeout.
 static void tofReinit() {
-    TSLOG("[ToF]  REINIT – bus I2C corrompu, réinitialisation capteurs...");
+    TSLOG("[ToF]  REINIT – reset TCA + capteurs...");
+
+    // Désactiver tous les canaux TCA pour libérer le bus
+    // Ne PAS appeler Wire.end()/Wire.begin() : corrompt le stack BLE (Core 0)
+    Wire.beginTransmission(TCA9548A_ADDR);
+    Wire.write(0x00);
+    Wire.endTransmission();
+    vTaskDelay(pdMS_TO_TICKS(20));
+
     for (uint8_t i = 0; i < 2; i++) {
         tcaSelect(i);
-        vTaskDelay(pdMS_TO_TICKS(5));
-        if (tof[i].init()) {
-            tof[i].setMeasurementTimingBudget(20000);
-            tof[i].startContinuous(20);
-            TSLOG("[ToF]  #%d réinitialisé OK", i + 1);
-        } else {
-            TSLOG("[ToF]  #%d ERREUR reinit", i + 1);
+        vTaskDelay(pdMS_TO_TICKS(30));  // laisser le capteur booter
+        bool ok = false;
+        for (uint8_t attempt = 0; attempt < 3 && !ok; attempt++) {
+            if (tof[i].init()) {
+                tof[i].setTimeout(25);  // CRITIQUE : restaurer le timeout court après init()
+                tof[i].setMeasurementTimingBudget(20000);
+                tof[i].startContinuous(20);
+                gTofInitOk[i] = true;
+                TSLOG("[ToF]  #%d réinitialisé OK (essai %d)", i + 1, attempt + 1);
+                ok = true;
+            } else {
+                gTofInitOk[i] = false;
+                vTaskDelay(pdMS_TO_TICKS(30));
+            }
         }
+        if (!ok) TSLOG("[ToF]  #%d ERREUR reinit (3 essais)", i + 1);
     }
+    vTaskDelay(pdMS_TO_TICKS(30));  // attendre la première mesure
 }
 
 static void ToFTask(void*) {
@@ -550,14 +575,16 @@ static void ToFTask(void*) {
 
         if (xSemaphoreTake(gI2cMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             // Canal 0
-            tcaSelect(0);
-            d0 = tof[0].readRangeContinuousMillimeters();
-            t0 = tof[0].timeoutOccurred();
-
-            // Canal 1
-            tcaSelect(1);
-            d1 = tof[1].readRangeContinuousMillimeters();
-            t1 = tof[1].timeoutOccurred();
+            if (gTofInitOk[0]) {
+                tcaSelect(0);
+                d0 = tof[0].readRangeContinuousMillimeters();
+                t0 = tof[0].timeoutOccurred();
+            }
+            if (gTofInitOk[1]) {
+                tcaSelect(1);
+                d1 = tof[1].readRangeContinuousMillimeters();
+                t1 = tof[1].timeoutOccurred();
+            }
 
             xSemaphoreGive(gI2cMutex);
         }
@@ -567,8 +594,13 @@ static void ToFTask(void*) {
         gTofDistMm[1]  = t1 ? 0 : d1;
         gTofTimeout[1] = t1;
 
+        // 8191mm = valeur d'erreur VL53L0X (VCSEL timeout interne sans flag timeout)
+        // On la traite comme un timeout pour le compteur de récupération
+        const bool err0 = t0 || (d0 >= 8000);
+        const bool err1 = t1 || (d1 >= 8000);
+
         // Récupération sur timeout persistant (bruit I2C des moteurs)
-        if (t0 && t1) {
+        if (err0 && err1) {
             consecutiveTimeouts++;
             if (consecutiveTimeouts >= TOF_REINIT_THRESH) {
                 consecutiveTimeouts = 0;
@@ -872,17 +904,25 @@ public:
     virtual const char* nom()  = 0;
 };
 
-// Attaque : fonce à pleine vitesse vers l'adversaire
+// Attaque : vitesse graduée selon distance capteur central (ToF[0])
+//   > 250 mm → approche douce  40%
+//   100-250mm → pression       55%
+//    < 100 mm → sprint final   70%
 class StrategieCharge : public IStrategieRobot {
-    uint32_t _debut = 0;
-    bool     _done  = false;
+    bool _done = false;
 public:
-    void demarrer() override {
-        _debut = millis(); _done = false;
-        Bot::avancer(MOTOR_PWM_MAX);
-    }
+    void demarrer() override { _done = false; Bot::avancer(MOTOR_PWM_MAX * 30 / 100); }
     void mettreAJour() override {
-        if (millis() - _debut >= 2000) { Bot::arreter(); _done = true; }
+        const uint16_t dist = gTofDistMm[0];
+        if (gTofTimeout[0] || dist >= TOF_LOST_MM) {
+            Bot::avancer(MOTOR_PWM_MAX * 30 / 100);   // adversaire hors portée – avance doucement
+        } else if (dist > 250) {
+            Bot::avancer(MOTOR_PWM_MAX * 30 / 100);   // loin : approche lente
+        } else if (dist > 100) {
+            Bot::avancer(MOTOR_PWM_MAX * 42 / 100);   // proche : pression
+        } else {
+            Bot::avancer(MOTOR_PWM_MAX * 60 / 100);   // très proche : sprint final
+        }
     }
     void arreter()     override { Bot::arreter(); _done = true; }
     bool estTerminee() override { return _done; }
@@ -893,7 +933,7 @@ public:
 class StrategieRotation : public IStrategieRobot {
     bool _done = false;
 public:
-    void demarrer() override { _done = false; Bot::pivoterCW(MOTOR_PWM_MAX * 50 / 100); }
+    void demarrer() override { _done = false; Bot::pivoterCW(MOTOR_PWM_MAX * 35 / 100); }  // 35% – recherche
     void mettreAJour() override {}   // FSM interrompt si adversaire détecté
     void arreter()     override { Bot::arreter(); _done = true; }
     bool estTerminee() override { return _done; }
@@ -1050,12 +1090,15 @@ static void AutoTask(void*) {
 static void WattTask(void*) {
     vTaskDelay(pdMS_TO_TICKS(600));
     uint32_t lastMs = millis();
+    uint8_t  inaFailCount = 0;
 
     for (;;) {
-        if (gInaOk && xSemaphoreTake(gI2cMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (gInaOk && inaFailCount < 5 &&
+            xSemaphoreTake(gI2cMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             const float shuntMv  = ina219.getShuntVoltage_mV();
             const float busV     = ina219.getBusVoltage_V();
             xSemaphoreGive(gI2cMutex);
+            inaFailCount = 0;  // lecture OK – réinitialise compteur
 
             // Shunt 10 mΩ : I(mA) = Vshunt(mV) / 0.010 Ω / 1000 = Vshunt(mV) × 100
             const float currentMa = shuntMv * 100.0f;
@@ -1072,6 +1115,15 @@ static void WattTask(void*) {
             if (currentMa > 0.0f) {
                 gAccEnergyWh  += (powerMw / 1000.0f) * dtH;
                 gAccChargeMah += currentMa * dtH;
+            }
+        } else if (gInaOk) {
+            // mutex timeout ou inaFailCount >= 5 : bus I2C occupé ou bloqué
+            inaFailCount++;
+            if (inaFailCount >= 5) {
+                // Arrête de réessayer pendant 10s pour éviter la fuite heap I2C
+                TSLOG("[Watt]  Bus I2C bloque – pause 10s");
+                vTaskDelay(pdMS_TO_TICKS(10000));
+                inaFailCount = 0;
             }
         }
         vTaskDelay(pdMS_TO_TICKS(1000 / WATT_TASK_FREQ));
@@ -1268,6 +1320,7 @@ void setup() {
 
     // ── I2C + OLED ────────────────────────────────────────────────────────────
     Wire.begin(PIN_IIC_SDA, PIN_IIC_SCL);
+    Wire.setClock(400000);  // 400 kHz fast mode
     Serial.printf("[I2C]   SDA=%d  SCL=%d  TCA=0x%02X\n",
                   PIN_IIC_SDA, PIN_IIC_SCL, TCA9548A_ADDR);
 
@@ -1301,16 +1354,50 @@ void setup() {
     }
 
     // ── VL53L0X via TCA9548A (adresse mux = 0x70) ────────────────────────────
+    // Récupération bus I2C (setup uniquement – BLE pas encore démarré, Wire.end() safe)
+    auto i2cBusRecover = []() {
+        Wire.end();
+        delay(5);
+        // 9 impulsions SCL pour libérer SDA bloqué par le capteur (I2C bus clear)
+        pinMode(PIN_IIC_SCL, OUTPUT);
+        pinMode(PIN_IIC_SDA, OUTPUT);
+        for (int p = 0; p < 9; p++) {
+            digitalWrite(PIN_IIC_SCL, HIGH); delayMicroseconds(5);
+            digitalWrite(PIN_IIC_SCL, LOW);  delayMicroseconds(5);
+        }
+        // Condition STOP (SDA LOW→HIGH pendant SCL HIGH)
+        digitalWrite(PIN_IIC_SDA, LOW);
+        digitalWrite(PIN_IIC_SCL, HIGH); delayMicroseconds(5);
+        digitalWrite(PIN_IIC_SDA, HIGH); delayMicroseconds(5);
+        delay(5);
+        Wire.begin(PIN_IIC_SDA, PIN_IIC_SCL);
+        Wire.setClock(400000);
+        delay(10);
+        Serial.println("[I2C]   Bus recover OK");
+    };
+
     for (uint8_t i = 0; i < 2; i++) {
         tcaSelect(i);
         delay(10);
         tof[i].setTimeout(25);   // timeout court → jamais bloquant plus de 25ms
-        if (!tof[i].init()) {
+        bool ok = false;
+        for (uint8_t attempt = 0; attempt < 3 && !ok; attempt++) {
+            if (tof[i].init()) {
+                tof[i].setMeasurementTimingBudget(20000);
+                tof[i].startContinuous(20);
+                gTofInitOk[i] = true;
+                Serial.printf("[ToF]   #%d OK     (TCA canal %d)\n", i + 1, i);
+                ok = true;
+            } else {
+                Serial.printf("[ToF]   #%d tentative %d/3 echouee, recuperation bus...\n", i + 1, attempt + 1);
+                i2cBusRecover();
+                tcaSelect(i);
+                delay(20);
+            }
+        }
+        if (!ok) {
+            gTofInitOk[i] = false;
             Serial.printf("[ToF]   #%d ERREUR (TCA canal %d)\n", i + 1, i);
-        } else {
-            tof[i].setMeasurementTimingBudget(20000);  // 20ms = 50Hz max
-            tof[i].startContinuous(20);                // nouvelle mesure toutes les 20ms
-            Serial.printf("[ToF]   #%d OK     (TCA canal %d)\n", i + 1, i);
         }
     }
 
@@ -1332,27 +1419,16 @@ void setup() {
     Serial.printf("[Ligne] MID=GPIO%d  RIGHT=GPIO%d  LEFT=GPIO%d  ADC 12-bit\n",
                   PIN_LINE_MID, PIN_LINE_RIGHT, PIN_LINE_LEFT);
 
-    // ── Xbox BLE (démarré avant WiFi) ─────────────────────────────────────────
-    xbox.begin(onXboxInput);
-    Serial.println("[Xbox]  BLE scan démarré");
-    delay(200);
-
     // ── BOOT button ───────────────────────────────────────────────────────────
     pinMode(PIN_BUTTON_1, INPUT_PULLUP);
     Serial.printf("[Btn]   BOOT=GPIO%d  appui = test moteur\n", PIN_BUTTON_1);
 
-    // ── WiFi ──────────────────────────────────────────────────────────────────
-    Serial.printf("[WiFi]  Connexion a '%s'...\n", WIFI_SSID);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    const uint32_t wifiTimeout = millis() + 10000;
-    while (WiFi.status() != WL_CONNECTED && millis() < wifiTimeout) {
-        delay(500);
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("[WiFi]  Connecte  IP=%s\n", WiFi.localIP().toString().c_str());
-    } else {
-        Serial.println("[WiFi]  ECHEC – TCP desactive");
-    }
+    // ── WiFi DÉSACTIVÉ (test diagnostic) ─────────────────────────────────────
+    Serial.println("[WiFi]  DESACTIVE (test)");
+
+    // ── Xbox BLE (après WiFi – radio 2.4GHz déjà initialisée, pas de race) ───
+    xbox.begin(onXboxInput);
+    Serial.println("[Xbox]  BLE scan démarré");
 
     // ── Tasks ─────────────────────────────────────────────────────────────────
     if (WiFi.status() == WL_CONNECTED) {
@@ -1360,11 +1436,11 @@ void setup() {
     }
     xTaskCreatePinnedToCore(BuzzerTask,  "BuzzerTask",  2048, nullptr, 2, nullptr, 0);
     xTaskCreatePinnedToCore(EncoderTask, "EncoderTask", 2048, nullptr, 1, nullptr, 0);
-    xTaskCreatePinnedToCore(ToFTask,     "ToFTask",     2048, nullptr, 1, nullptr, 0);  // I2C 2Hz
-    xTaskCreatePinnedToCore(SensorTask,  "SensorTask",  2048, nullptr, 2, nullptr, 0);  // ADC 100Hz
+    xTaskCreatePinnedToCore(ToFTask,     "ToFTask",     2048, nullptr, 1, nullptr, 1);  // Core 1 – même core que Wire.begin()
+    xTaskCreatePinnedToCore(SensorTask,  "SensorTask",  2048, nullptr, 2, nullptr, 0);  // ADC 100Hz, Core 0
     xTaskCreatePinnedToCore(StatusTask,  "StatusTask",  2048, nullptr, 1, nullptr, 0);
-    xTaskCreatePinnedToCore(WattTask,    "WattTask",    2048, nullptr, 1, nullptr, 0);
-    xTaskCreatePinnedToCore(OledTask,    "OledTask",    5120, nullptr, 1, nullptr, 0);
+    xTaskCreatePinnedToCore(WattTask,    "WattTask",    4096, nullptr, 1, nullptr, 1);  // Core 1 – même core que Wire.begin()
+    xTaskCreatePinnedToCore(OledTask,    "OledTask",    5120, nullptr, 1, nullptr, 1);  // Core 1 – même core que Wire.begin()
     xTaskCreatePinnedToCore(AutoTask,    "AutoTask",    3072, nullptr, 2, nullptr, 1);  // +1024 pour ControleurCombat+strategies
     Serial.println("[Tasks] Demarre");
 
