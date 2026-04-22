@@ -711,13 +711,13 @@ public:
         if (dist < 150) { _pushing = true; _pushUntilMs = now + 1500; }
 
         if (_pushing && now < _pushUntilMs) {
-            Bot::avancer(MOTOR_PWM_MAX * 55 / 100);   // poussée soutenue
+            Bot::avancer(MOTOR_PWM_MAX * 42 / 100);   // poussée soutenue
         } else {
             _pushing = false;
-            if      (dist >= TOF_LOST_MM) Bot::avancer(MOTOR_PWM_MAX * 22 / 100);  // recherche
-            else if (dist > 300)          Bot::avancer(MOTOR_PWM_MAX * 27 / 100);  // loin
-            else if (dist > 150)          Bot::avancer(MOTOR_PWM_MAX * 40 / 100);  // proche
-            else                          Bot::avancer(MOTOR_PWM_MAX * 52 / 100);  // sprint
+            if      (dist >= TOF_LOST_MM) Bot::avancer(MOTOR_PWM_MAX * 17 / 100);  // recherche
+            else if (dist > 300)          Bot::avancer(MOTOR_PWM_MAX * 20 / 100);  // loin
+            else if (dist > 150)          Bot::avancer(MOTOR_PWM_MAX * 30 / 100);  // proche
+            else                          Bot::avancer(MOTOR_PWM_MAX * 40 / 100);  // sprint
         }
     }
     void arreter()     override { Bot::arreter(); _done = true; }
