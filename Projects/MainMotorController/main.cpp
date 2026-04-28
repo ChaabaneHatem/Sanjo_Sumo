@@ -1,12 +1,14 @@
 /*
- * Sanjo Sumo – Phase 1
+ * Sanjo Sumo – Projet Final (Labo 6 – Combat)
  * ──────────────────────────────────────────────────────────────────────────────
  * Hardware : ESP32 CH340C (38-pin DevKit) + TB6612FNG motor driver + N20 encoders
  * Features :
  *   - Xbox Series X controller via BLE → tank drive (LT/RT)
  *   - WiFi TCP server (port 8080) → commandes HMI JSON
  *   - Quadrature encoder speed reading
- *   - Motor self-test via BOOT button
+ *   - 5x VL53L0X ToF via TCA9548A I2C mux
+ *   - 3x capteurs ligne ADC
+ *   - FSM combat : RECHERCHE / ATTAQUE / DEFENSE (pattern Strategy)
  *
  * Contrôle Xbox :
  *   LT (trigger) → roue gauche avant   (proportionnel)
@@ -14,7 +16,8 @@
  *   LB (bumper)  → roue gauche arrière (pleine vitesse)
  *   RB (bumper)  → roue droite arrière (pleine vitesse)
  *   A            → cycle 6 vitesses : 17/33/50/67/83/100%
- *   BOOT button  → test moteur séquentiel (+25 PWM chaque appui)
+ *   B            → toggle MANUEL / AUTO (combat)
+ *   X            → toggle SUIVI LIGNE
  */
 
 #include <Arduino.h>
@@ -27,7 +30,6 @@
 #include <Wire.h>
 #include <VL53L0X.h>
 #include <Adafruit_INA219.h>
-
 #include "main.h"
 #include "pins_config.h"
 #include "MotorDriver.h"
@@ -48,18 +50,10 @@ Encoder encRight(ENC_B_C1, ENC_B_C2, 1);
 
 VL53L0X tof[5];   // [0]=avant-centre  [1]=côté-droit  [2]=avant-droit  [3]=avant-gauche  [4]=côté-gauche
 
-Adafruit_INA219  ina219(INA219_I2C_ADDR);
+Adafruit_INA219 ina219(INA219_I2C_ADDR);
 
 // ─── Globals + thread-safe TSLOG ─────────────────────────────────────────────
 
-static volatile bool     gMotorTestActive  = false;
-
-// ─── Test distance ─────────────────────────────────────────────────────────
-static volatile bool  gDistTestActive  = false;  // moteurs en course
-static volatile bool  gDistTestDone    = false;  // résultats prêts à afficher
-static volatile float gDistTestL_cm   = 0.0f;   // distance roue gauche (cm)
-static volatile float gDistTestR_cm   = 0.0f;   // distance roue droite (cm)
-static volatile float gDistTestVmax   = 0.0f;   // vitesse max mesurée (cm/s)
 static SemaphoreHandle_t gSerialMutex     = nullptr;
 static SemaphoreHandle_t gI2cMutex        = nullptr;  // protège Wire (ToF + OLED + INA219)
 
@@ -78,12 +72,9 @@ static volatile float    gVelRightCms    = 0.0f;  // vitesse roue droite (cm/s, 
 
 // ─── INA219 globals ───────────────────────────────────────────────────────────
 static volatile bool  gInaOk        = false;
-static volatile float gInaShuntMv   = 0.0f;   // tension shunt (mV)
-static volatile float gInaBusV      = 0.0f;   // tension bus (V) ≈ Vbat
-static volatile float gInaCurrentMa = 0.0f;   // courant (mA)
-static volatile float gInaPowerMw   = 0.0f;   // puissance (mW)
-static volatile float gAccEnergyWh  = 0.0f;   // énergie accumulée (Wh)
-static volatile float gAccChargeMah = 0.0f;   // charge accumulée (mAh)
+static volatile float gInaBusV      = 0.0f;
+static volatile float gInaCurrentMa = 0.0f;
+static volatile float gInaPowerMw   = 0.0f;
 
 // Sélecteur de vitesse : 6 paliers (index 0..5)
 static const uint8_t kGears[6] = { 17, 33, 50, 67, 83, 100 };
@@ -158,60 +149,6 @@ static void tcaSelect(uint8_t channel) {
     delayMicroseconds(300);  // stabilisation bus après changement de canal
 }
 
-// ─── ControleurLedRgb ────────────────────────────────────────────────────────
-
-class ControleurLedRgb {
-    uint8_t _pinR, _pinG, _pinB;
-    uint8_t _r = 0, _g = 0, _b = 0;
-public:
-    ControleurLedRgb(uint8_t pinR, uint8_t pinG, uint8_t pinB)
-        : _pinR(pinR), _pinG(pinG), _pinB(pinB) {}
-    void begin() {
-        ledcSetup(LED_PWM_CHANNEL_R, LED_PWM_FREQ_HZ, LED_PWM_RES_BITS);
-        ledcSetup(LED_PWM_CHANNEL_G, LED_PWM_FREQ_HZ, LED_PWM_RES_BITS);
-        ledcSetup(LED_PWM_CHANNEL_B, LED_PWM_FREQ_HZ, LED_PWM_RES_BITS);
-        ledcAttachPin(_pinR, LED_PWM_CHANNEL_R);
-        ledcAttachPin(_pinG, LED_PWM_CHANNEL_G);
-        ledcAttachPin(_pinB, LED_PWM_CHANNEL_B);
-        setRgb(0, 0, 0);
-    }
-    void setRgb(uint8_t r, uint8_t g, uint8_t b) {
-        _r = r; _g = g; _b = b;
-        ledcWrite(LED_PWM_CHANNEL_R, r);
-        ledcWrite(LED_PWM_CHANNEL_G, g);
-        ledcWrite(LED_PWM_CHANNEL_B, b);
-    }
-    void allumer()    { setRgb(255, 255, 255); }
-    void eteindre()   { setRgb(0, 0, 0);       }
-    bool estAllumee() { return _r || _g || _b;  }
-};
-
-static ControleurLedRgb led(PIN_LED_R, PIN_LED_G, PIN_LED_B);
-
-// ─── Motor self-test ─────────────────────────────────────────────────────────
-
-static void testMotors(int speed, int durationMs) {
-    gMotorTestActive = true;
-    TSLOG("[Test] SPD=%-3d  DUR=%dms", speed, durationMs);
-
-    struct Step { MotorDriver* m; int16_t spd; const char* label; };
-    const Step steps[] = {
-        { &motorLeft,   (int16_t) speed, "L avant"  },
-        { &motorLeft,   (int16_t)-speed, "L arriere"},
-        { &motorRight,  (int16_t) speed, "R avant"  },
-        { &motorRight,  (int16_t)-speed, "R arriere"},
-    };
-    for (const auto& s : steps) {
-        TSLOG("[Test] %-10s spd=%+d", s.label, s.spd);
-        s.m->setSpeed(s.spd);
-        delay(durationMs);
-        s.m->stop();
-        delay(200);
-    }
-    TSLOG("[Test] Done");
-    gMotorTestActive = false;
-}
-
 // ─── Xbox input callback ──────────────────────────────────────────────────────
 // LT  → roue gauche avant  (proportionnel au niveau d'appui)
 // RT  → roue droite avant  (proportionnel au niveau d'appui)
@@ -221,7 +158,6 @@ static void testMotors(int speed, int durationMs) {
 
 static void onXboxInput(const XboxState& s) {
     gXboxConnected = s.connected;
-    if (gMotorTestActive) return;
 
     // ── B : toggle MANUAL / AUTO ──────────────────────────────────────────────
     static bool prevB = false;
@@ -256,10 +192,6 @@ static void onXboxInput(const XboxState& s) {
         }
     }
     prevX = s.btnX;
-
-    // ── Y : (non utilisé) ────────────────────────────────────────────────────
-    static bool prevY = false;
-    prevY = s.btnY;
 
     // ── A : cycle vitesse (actif aussi en AUTO) ────────────────────────────────
     static bool prevA = false;
@@ -381,19 +313,6 @@ static String handleCommand(const String& json) {
         gRobotMode = ROBOT_MODE_LINE;
         buzzerMelody(kSoundAutoOn,
              sizeof(kSoundAutoOn) / sizeof(BuzzerNote));
-
-    } else if (strcmp(cmd, "suivre_ligne") == 0) {
-        TSLOG("[Cmd] suivre_ligne → MODE AUTO");
-        motorLeft.stop(); motorRight.stop();
-        gRobotMode = ROBOT_MODE_AUTO;
-        buzzerMelody(kSoundAutoOn, sizeof(kSoundAutoOn) / sizeof(BuzzerNote));
-
-    } else if (strcmp(cmd, "tuning") == 0) {
-        // Paramètres reçus du RPi – réservé pour asservissement PD
-        TSLOG("[Cmd] tuning kp=%.1f kd=%.1f vbase=%d vmin=%d vmax=%d seuil=%d",
-              doc["kp"].as<float>(), doc["kd"].as<float>(),
-              doc["vbase"].as<int>(), doc["vmin"].as<int>(), 
-              doc["vmax"].as<int>(), doc["seuil"].as<int>());
 
     } else if (strcmp(cmd, "set_vitesse") == 0) {
         gSpeedPct = (uint8_t)constrain(doc["valeur"].as<int>(), 0, 100);
@@ -562,11 +481,6 @@ static void EncoderTask(void*) {
         gVelLeftCms  = -velL;
         gVelRightCms =  velR;
 
-        if (!gMotorTestActive) {
-            TSLOG("[Enc] L:%+6.1fcm/s  R:%+6.1fcm/s  |  L:%+7ld  R:%+7ld cnt",
-                  gVelLeftCms, gVelRightCms,
-                  encLeft.getCount(), encRight.getCount());
-        }
         vTaskDelay(pdMS_TO_TICKS(1000 / ENCODER_TASK_FREQ));
     }
 }
@@ -900,6 +814,20 @@ static void AutoTask(void*) {
     }
 }
 
+// ─── Buzzer task ─────────────────────────────────────────────────────────────
+
+static void BuzzerTask(void*) {
+    BuzzerNote n;
+    for (;;) {
+        if (xQueueReceive(gBuzzerQueue, &n, portMAX_DELAY) == pdTRUE) {
+            if (n.freq > 0) ledcWriteTone(BUZZER_LEDC_CHANNEL, n.freq);
+            else            ledcWrite(BUZZER_LEDC_CHANNEL, 0);
+            vTaskDelay(pdMS_TO_TICKS(n.ms));
+            ledcWrite(BUZZER_LEDC_CHANNEL, 0);
+        }
+    }
+}
+
 // ─── Watt task – 2 Hz ────────────────────────────────────────────────────────
 
 static void WattTask(void*) {
@@ -913,52 +841,27 @@ static void WattTask(void*) {
             const float shuntMv  = ina219.getShuntVoltage_mV();
             const float busV     = ina219.getBusVoltage_V();
             xSemaphoreGive(gI2cMutex);
-            inaFailCount = 0;  // lecture OK – réinitialise compteur
+            inaFailCount = 0;
 
-            // Shunt 10 mΩ : I(mA) = Vshunt(mV) / 0.010 Ω / 1000 = Vshunt(mV) × 100
+            // Shunt 10 mΩ : I(mA) = Vshunt(mV) × 100
             const float currentMa = shuntMv * 100.0f;
             const float powerMw   = busV * currentMa;
 
-            const uint32_t now = millis();
-            const float dtH = (float)(now - lastMs) / 3600000.0f;
-            lastMs = now;
-
-            gInaShuntMv   = shuntMv;
             gInaBusV      = busV;
             gInaCurrentMa = currentMa;
             gInaPowerMw   = powerMw;
-            if (currentMa > 0.0f) {
-                gAccEnergyWh  += (powerMw / 1000.0f) * dtH;
-                gAccChargeMah += currentMa * dtH;
-            }
-            TSLOG("[Watt] Vbat=%.2fV  I=%.0fmA  P=%.2fW  Eh=%.4fWh  Qh=%.1fmAh",
-                  busV, currentMa, powerMw / 1000.0f, gAccEnergyWh, gAccChargeMah);
+
+            TSLOG("[Watt] Vbat=%.2fV  I=%.0fmA  P=%.2fW",
+                  busV, currentMa, powerMw / 1000.0f);
         } else if (gInaOk) {
-            // mutex timeout ou inaFailCount >= 5 : bus I2C occupé ou bloqué
             inaFailCount++;
             if (inaFailCount >= 5) {
-                // Arrête de réessayer pendant 10s pour éviter la fuite heap I2C
                 TSLOG("[Watt]  Bus I2C bloque – pause 10s");
                 vTaskDelay(pdMS_TO_TICKS(10000));
                 inaFailCount = 0;
             }
         }
         vTaskDelay(pdMS_TO_TICKS(1000 / WATT_TASK_FREQ));
-    }
-}
-
-
-// ─── Buzzer task ─────────────────────────────────────────────────────────────
-
-static void BuzzerTask(void*) {
-    BuzzerNote n;
-    for (;;) {
-        if (xQueueReceive(gBuzzerQueue, &n, portMAX_DELAY) == pdTRUE) {
-            if (n.freq > 0) ledcWriteTone(BUZZER_LEDC_CHANNEL, n.freq);
-            else            ledcWrite(BUZZER_LEDC_CHANNEL, 0);
-            vTaskDelay(pdMS_TO_TICKS(n.ms));
-            ledcWrite(BUZZER_LEDC_CHANNEL, 0);
-        }
     }
 }
 
@@ -1038,8 +941,14 @@ void setup() {
     Serial.printf("[I2C]   SDA=%d  SCL=%d  TCA=0x%02X\n",
                   PIN_IIC_SDA, PIN_IIC_SCL, TCA9548A_ADDR);
 
-    // ── INA219 DÉSACTIVÉ ─────────────────────────────────────────────────────
-    Serial.println("[INA219] desactive");
+    // ── INA219 (tension batterie + courant) ──────────────────────────────────
+    if (ina219.begin()) {
+        ina219.setCalibration_16V_400mA();
+        gInaOk = true;
+        Serial.println("[INA219] OK");
+    } else {
+        Serial.println("[INA219] absent");
+    }
 
     // ── VL53L0X via TCA9548A (adresse mux = 0x70) ────────────────────────────
     auto i2cBusRecover = []() {
@@ -1135,7 +1044,8 @@ void setup() {
     xTaskCreatePinnedToCore(EncoderTask, "EncoderTask", 2048, nullptr, 1, nullptr, 0);
     xTaskCreatePinnedToCore(StatusTask,  "StatusTask",  2048, nullptr, 1, nullptr, 0);
     xTaskCreatePinnedToCore(ToFTask,     "ToFTask",     3072, nullptr, 1, nullptr, 1);
-    xTaskCreatePinnedToCore(SensorTask,  "SensorTask",  2048, nullptr, 2, nullptr, 0);  // ADC 100Hz, Core 0
+    xTaskCreatePinnedToCore(SensorTask,  "SensorTask",  2048, nullptr, 2, nullptr, 0);
+    xTaskCreatePinnedToCore(WattTask,    "WattTask",    2048, nullptr, 1, nullptr, 0);
     xTaskCreatePinnedToCore(AutoTask,    "AutoTask",    3072, nullptr, 2, nullptr, 1);
     Serial.println("[Tasks] Demarre");
 
@@ -1143,71 +1053,6 @@ void setup() {
         Serial.printf("[Setup] IP: %s  port TCP: %d\n", WiFi.localIP().toString().c_str(), TCP_PORT);
     }
     Serial.println("[Setup] Pret\n");
-}
-
-// ─── Test distance ────────────────────────────────────────────────────────────
-// Appui BOOT : moteurs avant à 100% pendant 5s, mesure distance via encodeurs.
-// cm/count = π × 26mm / (14 × 30 × 10)  =  81.68 / 4200  ≈ 0.01945 cm
-
-static void runDistanceTest() {
-    constexpr float kCmPerCount = (float)M_PI * ENCODER_WHEEL_DIAM_MM
-                                  / (float)(ENCODER_PPR * ENCODER_GEAR_RATIO * 10);
-    constexpr uint32_t kDurMs   = 5000;
-    constexpr uint16_t kSampleMs = 200;  // fenêtre de vitesse max
-
-    gDistTestActive = true;
-    gDistTestDone   = false;
-    TSLOG("[DistTest] START  PWM=255  duree=%ums", kDurMs);
-
-    // Reset compteurs
-    encLeft.resetCount();
-    encRight.resetCount();
-
-    float vmaxL = 0.0f, vmaxR = 0.0f;
-    int32_t prevL = 0, prevR = 0;
-    uint32_t tPrev = millis();
-
-    // Moteurs à fond – gauche miroir donc négatif
-    motorLeft.setSpeed(-MOTOR_PWM_MAX);
-    motorRight.setSpeed(MOTOR_PWM_MAX);
-
-    const uint32_t tStart = millis();
-    while (millis() - tStart < kDurMs) {
-        delay(kSampleMs);
-        encLeft.update();
-        encRight.update();
-
-        const int32_t cntL = encLeft.getCount();
-        const int32_t cntR = encRight.getCount();
-        const uint32_t tNow = millis();
-        const float dt = (tNow - tPrev) / 1000.0f;
-        tPrev = tNow;
-
-        // Vitesse instantanée sur la fenêtre (cm/s)
-        const float vL = fabsf((cntL - prevL) * kCmPerCount / dt);
-        const float vR = fabsf((cntR - prevR) * kCmPerCount / dt);
-        if (vL > vmaxL) vmaxL = vL;
-        if (vR > vmaxR) vmaxR = vR;
-        prevL = cntL;
-        prevR = cntR;
-    }
-
-    motorLeft.stop();
-    motorRight.stop();
-
-    encLeft.update();
-    encRight.update();
-
-    const float distL = fabsf(encLeft.getCount()  * kCmPerCount);
-    const float distR = fabsf(encRight.getCount() * kCmPerCount);
-
-    gDistTestL_cm  = distL;
-    gDistTestR_cm  = distR;
-    gDistTestVmax  = (vmaxL + vmaxR) * 0.5f;
-    gDistTestActive = false;
-    gDistTestDone   = true;
-
-    TSLOG("[DistTest] L=%.1fcm  R=%.1fcm  Vmax=%.1fcm/s", distL, distR, gDistTestVmax);
 }
 
 // ─── Loop ─────────────────────────────────────────────────────────────────────
