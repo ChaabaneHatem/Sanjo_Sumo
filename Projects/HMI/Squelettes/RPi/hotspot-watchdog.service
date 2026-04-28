@@ -1,0 +1,15 @@
+[Unit]
+Description=Watchdog hotspot WiFi (partage de connexion)
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /home/pi/hotspot-watchdog.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

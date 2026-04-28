@@ -41,7 +41,7 @@ MotorDriver motorLeft (MOTOR_A_PWM, MOTOR_A_IN1, MOTOR_A_IN2,
 MotorDriver motorRight(MOTOR_B_PWM, MOTOR_B_IN1, MOTOR_B_IN2,
                        /*channel=*/1, MOTOR_PWM_FREQ_HZ, MOTOR_PWM_RES_BITS, MOTOR_PWM_MAX);
 
-XboxController xbox("74:c4:12:b1:c0:3a");  // Xbox Series X – adresse BLE fixe
+XboxController xbox;  // scan BLE – se connecte à n'importe quelle manette Xbox
 
 Encoder encLeft (ENC_A_C1, ENC_A_C2, 0);
 Encoder encRight(ENC_B_C1, ENC_B_C2, 1);
@@ -228,14 +228,14 @@ static void onXboxInput(const XboxState& s) {
     if (s.btnB && !prevB) {
         if (gRobotMode == ROBOT_MODE_MANUAL) {
             gRobotMode = ROBOT_MODE_AUTO;
-            motorLeft.stop(); motorRight.stop();   // arrêt propre avant auto
+            motorLeft.stop(); motorRight.stop();
             buzzerMelody(kSoundAutoOn,  sizeof(kSoundAutoOn)  / sizeof(BuzzerNote));
-            TSLOG("[Mode] AUTO – évitement bordure actif");
+            TSLOG("[Mode] AUTO");
         } else {
             gRobotMode = ROBOT_MODE_MANUAL;
             motorLeft.stop(); motorRight.stop();
             buzzerMelody(kSoundAutoOff, sizeof(kSoundAutoOff) / sizeof(BuzzerNote));
-            TSLOG("[Mode] MANUEL – contrôle Xbox");
+            TSLOG("[Mode] MANUEL");
         }
     }
     prevB = s.btnB;
@@ -379,7 +379,8 @@ static String handleCommand(const String& json) {
         TSLOG("[Cmd] mode_ligne");
         motorLeft.stop(); motorRight.stop();
         gRobotMode = ROBOT_MODE_LINE;
-        buzzerMelody(kSoundAutoOn, sizeof(kSoundAutoOn) / sizeof(BuzzerNote));
+        buzzerMelody(kSoundAutoOn,
+             sizeof(kSoundAutoOn) / sizeof(BuzzerNote));
 
     } else if (strcmp(cmd, "suivre_ligne") == 0) {
         TSLOG("[Cmd] suivre_ligne → MODE AUTO");
@@ -391,7 +392,7 @@ static String handleCommand(const String& json) {
         // Paramètres reçus du RPi – réservé pour asservissement PD
         TSLOG("[Cmd] tuning kp=%.1f kd=%.1f vbase=%d vmin=%d vmax=%d seuil=%d",
               doc["kp"].as<float>(), doc["kd"].as<float>(),
-              doc["vbase"].as<int>(), doc["vmin"].as<int>(),
+              doc["vbase"].as<int>(), doc["vmin"].as<int>(), 
               doc["vmax"].as<int>(), doc["seuil"].as<int>());
 
     } else if (strcmp(cmd, "set_vitesse") == 0) {
@@ -483,6 +484,9 @@ static void pushTelemetry(WiFiClient& client) {
         doc["wifi"]        = (WiFi.status() == WL_CONNECTED);
         doc["mode"]        = (gRobotMode == ROBOT_MODE_AUTO) ? "auto"
                            : (gRobotMode == ROBOT_MODE_LINE) ? "ligne" : "manuel";
+        // Champs FSM attendus par le HMI
+        static const char* kEtatStr[] = {"ARRET","RECHERCHE","ATTAQUE","DEFENSE"};
+        doc["etat"]        = kEtatStr[(int)gEtatCombat];
         doc["gear"]        = (int)gGear + 1;
         doc["vitesse_pct"] = (int)gSpeedPct;
         doc["vbat"]        = (float)((int)(gInaBusV * 100)) / 100.0f;
@@ -585,24 +589,24 @@ static void tofReinit() {
 
     for (uint8_t i = 0; i < TOF_N; i++) {
         tcaSelect(i);
-        vTaskDelay(pdMS_TO_TICKS(30));  // laisser le capteur booter
+        vTaskDelay(pdMS_TO_TICKS(30));
         bool ok = false;
         for (uint8_t attempt = 0; attempt < 3 && !ok; attempt++) {
             if (tof[i].init()) {
-                tof[i].setTimeout(25);  // CRITIQUE : restaurer le timeout court après init()
+                tof[i].setTimeout(25);
                 tof[i].setMeasurementTimingBudget(20000);
                 tof[i].startContinuous(20);
                 gTofInitOk[i] = true;
-                TSLOG("[ToF]  #%d réinitialisé OK (essai %d)", i + 1, attempt + 1);
+                TSLOG("[ToF]  #%d réinitialisé OK (essai %d)", i, attempt + 1);
                 ok = true;
             } else {
                 gTofInitOk[i] = false;
                 vTaskDelay(pdMS_TO_TICKS(30));
             }
         }
-        if (!ok) TSLOG("[ToF]  #%d ERREUR reinit (3 essais)", i + 1);
+        if (!ok) TSLOG("[ToF]  #%d ERREUR reinit (3 essais)", i);
     }
-    vTaskDelay(pdMS_TO_TICKS(30));  // attendre la première mesure
+    vTaskDelay(pdMS_TO_TICKS(30));
 }
 
 static void ToFTask(void*) {
@@ -631,7 +635,6 @@ static void ToFTask(void*) {
             gTofTimeout[i] = t[i];
         }
 
-        // Reinit si tous les capteurs initialisés sont en erreur simultanément
         uint8_t errCount = 0, initCount = 0;
         for (uint8_t i = 0; i < TOF_N; i++) {
             if (gTofInitOk[i]) { initCount++; if (t[i] || d[i] >= 8000) errCount++; }
@@ -700,24 +703,23 @@ class StrategieCharge : public IStrategieRobot {
 public:
     void demarrer() override {
         _done = false; _pushing = false; _pushUntilMs = 0;
-        Bot::avancer(MOTOR_PWM_MAX * 30 / 100);
+        Bot::avancer(MOTOR_PWM_MAX * 22 / 100);
     }
     void mettreAJour() override {
-        // Capteur centre uniquement (tof[0] = avant-centre)
-        const uint16_t dist = gTofTimeout[0] ? 9999 : gTofDistMm[0];
+        const uint16_t raw0 = gTofTimeout[0] ? 9999 : gTofDistMm[0];
+        const uint16_t dist = (raw0 < 20) ? 9999 : raw0;
         const uint32_t now  = millis();
 
-        // Phase poussée : verrouille 1.5s au contact (ToF peu fiable)
         if (dist < 150) { _pushing = true; _pushUntilMs = now + 1500; }
 
         if (_pushing && now < _pushUntilMs) {
-            Bot::avancer(MOTOR_PWM_MAX * 42 / 100);   // poussée soutenue
+            Bot::avancer(MOTOR_PWM_MAX * 55 / 100);   // sprint – inchangé
         } else {
             _pushing = false;
-            if      (dist >= TOF_LOST_MM) Bot::avancer(MOTOR_PWM_MAX * 17 / 100);  // recherche
-            else if (dist > 300)          Bot::avancer(MOTOR_PWM_MAX * 20 / 100);  // loin
-            else if (dist > 150)          Bot::avancer(MOTOR_PWM_MAX * 30 / 100);  // proche
-            else                          Bot::avancer(MOTOR_PWM_MAX * 40 / 100);  // sprint
+            if      (dist >= TOF_LOST_MM) Bot::avancer(MOTOR_PWM_MAX * 17 / 100);
+            else if (dist > 300)          Bot::avancer(MOTOR_PWM_MAX * 22 / 100);
+            else if (dist > 150)          Bot::avancer(MOTOR_PWM_MAX * 33 / 100);
+            else                          Bot::avancer(MOTOR_PWM_MAX * 55 / 100);
         }
     }
     void arreter()     override { Bot::arreter(); _done = true; }
@@ -725,13 +727,27 @@ public:
     const char* nom()  override { return "Charge"; }
 };
 
-// Recherche : tourne sur place jusqu'à détection adversaire
+// Recherche : avance + pivot alterné pour couvrir l'arène ouvertement
 class StrategieRotation : public IStrategieRobot {
-    bool _done = false;
+    enum Phase { AVANCE, PIVOT } _phase = AVANCE;
+    bool     _done = false;
+    uint32_t _t    = 0;
 public:
-    void demarrer() override { _done = false; Bot::pivoterCW(MOTOR_PWM_MAX * 25 / 100); }
-    void mettreAJour() override {}
-    void arreter()     override { Bot::arreter(); _done = true; }
+    void demarrer() override {
+        _done = false; _phase = AVANCE; _t = millis();
+        Bot::avancer(MOTOR_PWM_MAX * 22 / 100);
+    }
+    void mettreAJour() override {
+        const uint32_t dt = millis() - _t;
+        if (_phase == AVANCE && dt >= 600) {
+            _phase = PIVOT; _t = millis();
+            Bot::pivoterCW(MOTOR_PWM_MAX * 45 / 100);   // pivot prononcé
+        } else if (_phase == PIVOT && dt >= 500) {
+            _phase = AVANCE; _t = millis();
+            Bot::avancer(MOTOR_PWM_MAX * 22 / 100);
+        }
+    }
+    void arreter()     override { _done = true; }
     bool estTerminee() override { return _done; }
     const char* nom()  override { return "Rotation"; }
 };
@@ -754,9 +770,9 @@ public:
         }
     }
     void mettreAJour() override {
-        if (millis() - _t >= AUTO_REVERSE_MS) { Bot::arreter(); _done = true; }
+        if (millis() - _t >= AUTO_REVERSE_MS) { _done = true; }
     }
-    void arreter()     override { Bot::arreter(); _done = true; }
+    void arreter()     override { _done = true; }
     bool estTerminee() override { return _done; }
     const char* nom()  override { return "Evitement"; }
 };
@@ -799,8 +815,9 @@ public:
         const bool bordR = gLineRight < LINE_THRESHOLD;
         const bool bord  = bordL || bordM || bordR;
 
-        // Capteur centre uniquement (tof[0] = avant-centre)
-        const uint16_t minFront = gTofTimeout[0] ? 9999 : gTofDistMm[0];
+        // Capteur centre uniquement – filtre < 60mm (faux positif chassis)
+        const uint16_t raw0    = gTofTimeout[0] ? 9999 : gTofDistMm[0];
+        const uint16_t minFront = (raw0 < 20) ? 9999 : raw0;
         const bool adversaire = minFront < TOF_ATTACK_MM;
         const bool perdu      = minFront >= TOF_LOST_MM;
 
@@ -844,13 +861,10 @@ static void suivreLigne() {
     const bool bR = gLineRight < LINE_THRESHOLD;
 
     if (bL || bM || bR) {
-        // Recul avec léger pivot vers l'intérieur de l'arène
         if (bL || (bM && !bR)) {
-            // Bord gauche → recule en pivotant vers la droite
             motorLeft.setSpeed(-(int16_t)(MOTOR_PWM_MAX * 15 / 100));
             motorRight.setSpeed(-(int16_t)(MOTOR_PWM_MAX * 42 / 100));
         } else {
-            // Bord droit → recule en pivotant vers la gauche
             motorLeft.setSpeed(-(int16_t)(MOTOR_PWM_MAX * 42 / 100));
             motorRight.setSpeed(-(int16_t)(MOTOR_PWM_MAX * 15 / 100));
         }
@@ -953,6 +967,12 @@ static void BuzzerTask(void*) {
 
 static void StatusTask(void*) {
     vTaskDelay(pdMS_TO_TICKS(666));
+    // Log IP au démarrage
+    if (WiFi.status() == WL_CONNECTED)
+        TSLOG("[WiFi]  IP=%s  port=%d", WiFi.localIP().toString().c_str(), TCP_PORT);
+    else
+        TSLOG("[WiFi]  Non connecte");
+
     bool prevConnected = false;
     for (;;) {
         XboxState s;
@@ -1041,6 +1061,9 @@ void setup() {
         Serial.println("[I2C]   Bus recover OK");
     };
 
+    static const char* kTofLabels[TOF_N] = {
+        "avant-centre", "cote-droit", "avant-droit", "avant-gauche", "cote-gauche"
+    };
     for (uint8_t i = 0; i < TOF_N; i++) {
         tcaSelect(i);
         delay(10);
@@ -1051,19 +1074,15 @@ void setup() {
                 tof[i].setMeasurementTimingBudget(20000);
                 tof[i].startContinuous(20);
                 gTofInitOk[i] = true;
-                Serial.printf("[ToF]   #%d OK     (TCA canal %d)\n", i + 1, i);
+                Serial.printf("[ToF]   #%d (%s) OK\n", i, kTofLabels[i]);
                 ok = true;
             } else {
-                Serial.printf("[ToF]   #%d tentative %d/3 echouee, recuperation bus...\n", i + 1, attempt + 1);
                 i2cBusRecover();
                 tcaSelect(i);
                 delay(20);
             }
         }
-        if (!ok) {
-            gTofInitOk[i] = false;
-            Serial.printf("[ToF]   #%d absent (TCA canal %d)\n", i + 1, i);
-        }
+        if (!ok) { gTofInitOk[i] = false; Serial.printf("[ToF]   #%d absent\n", i); }
     }
 
     // ── Buzzer ────────────────────────────────────────────────────────────────
@@ -1088,8 +1107,14 @@ void setup() {
     pinMode(PIN_BUTTON_1, INPUT_PULLUP);
     Serial.printf("[Btn]   BOOT=GPIO%d  appui = test moteur\n", PIN_BUTTON_1);
 
-    // ── WiFi ──────────────────────────────────────────────────────────────────
+    // ── Xbox BLE (démarrer AVANT WiFi pour priorité radio) ───────────────────
+    xbox.begin(onXboxInput);
+    Serial.println("[Xbox]  BLE scan demarre");
+    delay(200);  // laisser NimBLE s'initialiser
+
+    // ── WiFi (sleep mode pour coexistence BLE) ────────────────────────────────
     WiFi.mode(WIFI_STA);
+    WiFi.setSleep(true);   // modem sleep → libère le radio entre les paquets WiFi
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.printf("[WiFi]  Connexion %s", WIFI_SSID);
     {
@@ -1103,10 +1128,6 @@ void setup() {
     } else {
         Serial.println("\n[WiFi]  Echec – mode sans fil desactive");
     }
-
-    // ── Xbox BLE ─────────────────────────────────────────────────────────────
-    xbox.begin(onXboxInput);
-    Serial.println("[Xbox]  BLE scan demarre");
 
     // ── Tasks ─────────────────────────────────────────────────────────────────
     xTaskCreatePinnedToCore(TcpTask,     "TcpTask",     4096, nullptr, 1, nullptr, 0);
@@ -1194,11 +1215,11 @@ static void runDistanceTest() {
 void loop() {
     // Activation automatique du mode combat 5s après le démarrage
     static bool sAutoStartDone = false;
-    if (!sAutoStartDone && millis() > 5000) {
+    if (!sAutoStartDone && millis() > 2000) {
         sAutoStartDone = true;
         gRobotMode = ROBOT_MODE_AUTO;
         buzzerMelody(kSoundAutoOn, sizeof(kSoundAutoOn) / sizeof(BuzzerNote));
-        TSLOG("[Boot] → MODE AUTO (5s)");
+        TSLOG("[Boot] → MODE AUTO (2s)");
     }
 
     static bool lastBtn = HIGH;

@@ -37,6 +37,6 @@
 #define TOF_LOST_MM       600    // adversaire perdu → RECHERCHE (mm)
 
 // ─── WiFi / TCP (Lab 1) ───────────────────────────────────────────────────────
-#define WIFI_SSID  "RPi-Combat"
-#define WIFI_PASS  "combat123"
+#define WIFI_SSID  "I paw Jo"
+#define WIFI_PASS  "Newelo456"
 #define TCP_PORT   8080

@@ -1,0 +1,332 @@
+<!--
+    Laboratoire 6 — Combat !!
+    Fichier : MainWindow.axaml
+    HMI SCADA Hybride — 800x480
+-->
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="AvaloniaCombat.MainWindow"
+        Title="Labo 6 — Combat Sumo"
+        Width="800" Height="480"
+        CanResize="False"
+        Background="#0D1117"
+        FontFamily="Consolas">
+
+  <Grid ColumnDefinitions="185,*">
+
+    <!-- ══════════════════════════════════════════ -->
+    <!-- SIDEBAR GAUCHE — Réseau + Diagnostics      -->
+    <!-- ══════════════════════════════════════════ -->
+    <Border Grid.Column="0"
+            Background="#161B22"
+            BorderBrush="#FFC107"
+            BorderThickness="0,0,1,0">
+      <StackPanel Margin="12,16,12,12">
+
+        <!-- Section RÉSEAU -->
+        <TextBlock Text="RÉSEAU"
+                   Foreground="#FFC107"
+                   FontWeight="Bold"
+                   FontSize="13"
+                   Margin="0,0,0,12"/>
+
+        <TextBlock Text="Adresse IP"
+                   Foreground="#666666"
+                   FontSize="11"
+                   Margin="0,0,0,4"/>
+
+        <TextBox Text="{Binding AdresseIp}"
+                 Background="#0D1117"
+                 Foreground="White"
+                 BorderBrush="#FFC107"
+                 BorderThickness="1"
+                 Padding="6,4"
+                 FontSize="12"
+                 Margin="0,0,0,8"/>
+
+        <Button Content="{Binding TexteBoutonConnexion}"
+                Command="{Binding CommandeConnexion}"
+                HorizontalAlignment="Stretch"
+                Background="#1A1A2E"
+                Foreground="#FFC107"
+                BorderBrush="#FFC107"
+                BorderThickness="1"
+                Height="34"
+                FontSize="12"
+                Margin="0,0,0,10"/>
+
+        <TextBlock Text="{Binding StatutConnexion}"
+                   Foreground="{Binding CouleurStatut}"
+                   FontSize="12"
+                   Margin="0,0,0,16"/>
+
+        <!-- Séparateur -->
+        <Border Background="#FFC107" Height="1" Margin="0,0,0,16"/>
+
+        <!-- Section DIAGNOSTICS -->
+        <TextBlock Text="DIAGNOSTICS"
+                   Foreground="#FFC107"
+                   FontWeight="Bold"
+                   FontSize="13"
+                   Margin="0,0,0,12"/>
+
+        <TextBlock Text="{Binding Batterie, StringFormat='BAT : {0}'}"
+                   Foreground="#CCCCCC"
+                   FontSize="12"
+                   Margin="0,0,0,4"/>
+
+        <TextBlock Text="{Binding Direction, StringFormat='DIR : {0}'}"
+                   Foreground="#CCCCCC"
+                   FontSize="12"
+                   Margin="0,0,0,4"/>
+
+        <TextBlock Text="{Binding VitesseG, StringFormat='VG  : {0}'}"
+                   Foreground="#AAAAAA"
+                   FontSize="11"
+                   Margin="0,0,0,2"/>
+
+        <TextBlock Text="{Binding VitesseD, StringFormat='VD  : {0}'}"
+                   Foreground="#AAAAAA"
+                   FontSize="11"
+                   Margin="0,0,0,8"/>
+
+        <TextBlock Text="{Binding VitessePct, StringFormat='VIT : {0} %'}"
+                   Foreground="#AAAAAA"
+                   FontSize="11"
+                   Margin="0,0,0,2"/>
+
+        <TextBlock Text="{Binding Gear, StringFormat='GEAR : {0}'}"
+                   Foreground="#AAAAAA"
+                   FontSize="11"
+                   Margin="0,0,0,8"/>
+
+        <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+          <Ellipse Width="10" Height="10" Fill="{Binding CouleurXbox}" VerticalAlignment="Center" Margin="0,0,6,0"/>
+          <TextBlock Text="Xbox" Foreground="#AAAAAA" FontSize="11" VerticalAlignment="Center"/>
+        </StackPanel>
+
+        <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+          <Ellipse Width="10" Height="10" Fill="{Binding CouleurWifi}" VerticalAlignment="Center" Margin="0,0,6,0"/>
+          <TextBlock Text="WiFi" Foreground="#AAAAAA" FontSize="11" VerticalAlignment="Center"/>
+        </StackPanel>
+
+        <Border Background="#333333" Height="1" Margin="0,0,0,8"/>
+
+        <TextBlock Text="{Binding MessageStatut}"
+                   Foreground="#666666"
+                   FontSize="10"
+                   TextWrapping="Wrap"/>
+
+      </StackPanel>
+    </Border>
+
+    <!-- ══════════════════════════════════════════ -->
+    <!-- ZONE DROITE                                -->
+    <!-- ══════════════════════════════════════════ -->
+    <Grid Grid.Column="1" RowDefinitions="*,52,*">
+
+      <!-- ── Carte FSM ── -->
+      <Border Grid.Row="0"
+              Background="{Binding CouleurFondEtat}"
+              BorderBrush="{Binding CouleurEtat}"
+              BorderThickness="2"
+              CornerRadius="8"
+              Margin="10,10,10,5">
+        <StackPanel VerticalAlignment="Center"
+                    HorizontalAlignment="Center">
+
+          <TextBlock Text="ÉTAT DU COMBAT"
+                     Foreground="#444444"
+                     FontSize="11"
+                     HorizontalAlignment="Center"
+                     Margin="0,0,0,8"/>
+
+          <TextBlock Text="{Binding EtatFsm}"
+                     Foreground="{Binding CouleurEtat}"
+                     FontSize="54"
+                     FontWeight="Bold"
+                     HorizontalAlignment="Center"
+                     Margin="0,0,0,8"/>
+
+          <TextBlock Text="{Binding StrategieActive, StringFormat='Stratégie : {0}'}"
+                     Foreground="#888888"
+                     FontSize="13"
+                     HorizontalAlignment="Center"/>
+
+        </StackPanel>
+      </Border>
+
+      <!-- ── Ligne commandes principales ── -->
+      <Grid Grid.Row="1" ColumnDefinitions="*,*" Margin="10,0,10,5">
+
+        <Button Grid.Column="0"
+                Content="► DÉMARRER"
+                Command="{Binding CommandeDemarrer}"
+                Background="#1B4332"
+                Foreground="White"
+                BorderThickness="0"
+                FontWeight="Bold"
+                FontSize="14"
+                HorizontalAlignment="Stretch"
+                VerticalAlignment="Stretch"
+                Margin="0,0,4,0"/>
+
+        <Button Grid.Column="1"
+                Content="■ ARRÊT URGENCE"
+                Command="{Binding CommandeUrgence}"
+                Background="#C62828"
+                Foreground="White"
+                BorderThickness="0"
+                FontWeight="Bold"
+                FontSize="14"
+                HorizontalAlignment="Stretch"
+                VerticalAlignment="Stretch"
+                Margin="4,0,0,0"/>
+
+      </Grid>
+
+      <!-- ── Quadrants bas ── -->
+      <Grid Grid.Row="2" ColumnDefinitions="*,*" Margin="10,0,10,10">
+
+        <!-- Quadrant CAPTEURS -->
+        <Border Grid.Column="0"
+                Background="#161B22"
+                BorderBrush="#FFC107"
+                BorderThickness="1"
+                CornerRadius="6"
+                Margin="0,0,5,0">
+          <Grid RowDefinitions="Auto,*,*,*" Margin="12,10">
+
+            <!-- Header -->
+            <TextBlock Grid.Row="0"
+                       Text="CAPTEURS"
+                       Foreground="#FFC107"
+                       FontWeight="Bold"
+                       FontSize="12"
+                       Margin="0,0,0,4"/>
+
+            <!-- TOF Avant -->
+            <Grid Grid.Row="1" ColumnDefinitions="*,*,*" VerticalAlignment="Center">
+              <StackPanel Grid.Column="0" HorizontalAlignment="Center">
+                <TextBlock Text="AV-G" Foreground="#666666" FontSize="9" HorizontalAlignment="Center"/>
+                <TextBlock Text="{Binding TofAvG}" Foreground="#CCCCCC" FontSize="12" HorizontalAlignment="Center"/>
+              </StackPanel>
+              <StackPanel Grid.Column="1" HorizontalAlignment="Center">
+                <TextBlock Text="AV-C" Foreground="#666666" FontSize="9" HorizontalAlignment="Center"/>
+                <TextBlock Text="{Binding TofAvC}" Foreground="#CCCCCC" FontSize="12" HorizontalAlignment="Center"/>
+              </StackPanel>
+              <StackPanel Grid.Column="2" HorizontalAlignment="Center">
+                <TextBlock Text="AV-D" Foreground="#666666" FontSize="9" HorizontalAlignment="Center"/>
+                <TextBlock Text="{Binding TofAvD}" Foreground="#CCCCCC" FontSize="12" HorizontalAlignment="Center"/>
+              </StackPanel>
+            </Grid>
+
+            <!-- TOF Côtés -->
+            <Grid Grid.Row="2" ColumnDefinitions="*,*" VerticalAlignment="Center">
+              <StackPanel Grid.Column="0" HorizontalAlignment="Center">
+                <TextBlock Text="CT-G" Foreground="#666666" FontSize="9" HorizontalAlignment="Center"/>
+                <TextBlock Text="{Binding TofCtG}" Foreground="#CCCCCC" FontSize="12" HorizontalAlignment="Center"/>
+              </StackPanel>
+              <StackPanel Grid.Column="1" HorizontalAlignment="Center">
+                <TextBlock Text="CT-D" Foreground="#666666" FontSize="9" HorizontalAlignment="Center"/>
+                <TextBlock Text="{Binding TofCtD}" Foreground="#CCCCCC" FontSize="12" HorizontalAlignment="Center"/>
+              </StackPanel>
+            </Grid>
+
+            <!-- Capteurs de ligne -->
+            <Grid Grid.Row="3" ColumnDefinitions="*,*,*" VerticalAlignment="Center">
+              <StackPanel Grid.Column="0" HorizontalAlignment="Center">
+                <TextBlock Text="LIGNE" Foreground="#666666" FontSize="9" HorizontalAlignment="Center"/>
+                <Ellipse Width="14" Height="14" Fill="{Binding CouleurLigneAvG}" HorizontalAlignment="Center" Margin="0,3"/>
+                <TextBlock Text="AV-G" Foreground="#666666" FontSize="9" HorizontalAlignment="Center"/>
+              </StackPanel>
+              <StackPanel Grid.Column="1" HorizontalAlignment="Center">
+                <TextBlock Text="LIGNE" Foreground="#666666" FontSize="9" HorizontalAlignment="Center"/>
+                <Ellipse Width="14" Height="14" Fill="{Binding CouleurLigneAvD}" HorizontalAlignment="Center" Margin="0,3"/>
+                <TextBlock Text="AV-C" Foreground="#666666" FontSize="9" HorizontalAlignment="Center"/>
+              </StackPanel>
+              <StackPanel Grid.Column="2" HorizontalAlignment="Center">
+                <TextBlock Text="LIGNE" Foreground="#666666" FontSize="9" HorizontalAlignment="Center"/>
+                <Ellipse Width="14" Height="14" Fill="{Binding CouleurLigneArrC}" HorizontalAlignment="Center" Margin="0,3"/>
+                <TextBlock Text="AV-D" Foreground="#666666" FontSize="9" HorizontalAlignment="Center"/>
+              </StackPanel>
+            </Grid>
+
+          </Grid>
+        </Border>
+
+        <!-- Quadrant FORCER STRATÉGIE -->
+        <Border Grid.Column="1"
+                Background="#161B22"
+                BorderBrush="#FFC107"
+                BorderThickness="1"
+                CornerRadius="6"
+                Margin="5,0,0,0">
+          <Grid RowDefinitions="Auto,*" Margin="12,10">
+
+            <TextBlock Grid.Row="0"
+                       Text="COMMANDES"
+                       Foreground="#FFC107"
+                       FontWeight="Bold"
+                       FontSize="12"
+                       Margin="0,0,0,6"/>
+
+            <Grid Grid.Row="1" ColumnDefinitions="*,*" RowDefinitions="*,*">
+
+              <Button Grid.Row="0" Grid.Column="0"
+                      Content="Manuel"
+                      Command="{Binding CommandeStrategieCharge}"
+                      Background="#1A1A2E"
+                      Foreground="#CCCCCC"
+                      BorderBrush="#333355"
+                      BorderThickness="1"
+                      FontSize="12"
+                      HorizontalAlignment="Stretch"
+                      VerticalAlignment="Stretch"
+                      Margin="0,0,3,3"/>
+
+              <Button Grid.Row="0" Grid.Column="1"
+                      Content="Ligne"
+                      Command="{Binding CommandeStrategieCirculaire}"
+                      Background="#1A1A2E"
+                      Foreground="#CCCCCC"
+                      BorderBrush="#333355"
+                      BorderThickness="1"
+                      FontSize="12"
+                      HorizontalAlignment="Stretch"
+                      VerticalAlignment="Stretch"
+                      Margin="3,0,0,3"/>
+
+              <Button Grid.Row="1" Grid.Column="0"
+                      Content="▲ Avancer"
+                      Command="{Binding CommandeStrategieRecul}"
+                      Background="#1A1A2E"
+                      Foreground="#CCCCCC"
+                      BorderBrush="#333355"
+                      BorderThickness="1"
+                      FontSize="12"
+                      HorizontalAlignment="Stretch"
+                      VerticalAlignment="Stretch"
+                      Margin="0,3,3,0"/>
+
+              <Button Grid.Row="1" Grid.Column="1"
+                      Content="▼ Reculer"
+                      Command="{Binding CommandeStrategieEvitement}"
+                      Background="#1A1A2E"
+                      Foreground="#CCCCCC"
+                      BorderBrush="#333355"
+                      BorderThickness="1"
+                      FontSize="12"
+                      HorizontalAlignment="Stretch"
+                      VerticalAlignment="Stretch"
+                      Margin="3,3,0,0"/>
+
+            </Grid>
+          </Grid>
+        </Border>
+
+      </Grid>
+    </Grid>
+
+  </Grid>
+</Window>

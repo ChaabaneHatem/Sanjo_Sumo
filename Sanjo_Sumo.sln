@@ -1,0 +1,38 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Projects", "Projects", "{17245595-230B-9055-A944-863F0DDDA8E8}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "HMI", "HMI", "{788D01FF-CDB2-4D32-D07C-9735EC7AAAAA}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Squelettes", "Squelettes", "{65C7C727-9802-CAA1-72D9-53E2E694176D}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "RPi", "RPi", "{471650BB-E843-5655-57C6-6D72F8AE8552}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AvaloniaCombat", "Projects\HMI\Squelettes\RPi\AvaloniaCombat\AvaloniaCombat.csproj", "{D4AAC105-0BB8-1DE8-EC4C-4A3C0B7A1706}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{D4AAC105-0BB8-1DE8-EC4C-4A3C0B7A1706}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D4AAC105-0BB8-1DE8-EC4C-4A3C0B7A1706}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D4AAC105-0BB8-1DE8-EC4C-4A3C0B7A1706}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D4AAC105-0BB8-1DE8-EC4C-4A3C0B7A1706}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{788D01FF-CDB2-4D32-D07C-9735EC7AAAAA} = {17245595-230B-9055-A944-863F0DDDA8E8}
+		{65C7C727-9802-CAA1-72D9-53E2E694176D} = {788D01FF-CDB2-4D32-D07C-9735EC7AAAAA}
+		{471650BB-E843-5655-57C6-6D72F8AE8552} = {65C7C727-9802-CAA1-72D9-53E2E694176D}
+		{D4AAC105-0BB8-1DE8-EC4C-4A3C0B7A1706} = {471650BB-E843-5655-57C6-6D72F8AE8552}
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {1996B156-92A3-4511-BBBA-90155806E8D6}
+	EndGlobalSection
+EndGlobal
